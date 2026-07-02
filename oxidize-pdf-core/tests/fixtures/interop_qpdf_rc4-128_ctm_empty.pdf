@@ -1,0 +1,57 @@
+%PDF-1.7
+%ø˜¢˛
+1 0 obj
+<< /Metadata 3 0 R /Pages 4 0 R /Type /Catalog >>
+endobj
+2 0 obj
+<< /Author <fbcf9b4ff5a85ead9714db> /CreationDate <d08dc01baee40bb1d7418d78d31fbf930d7482caccb3> /Creator <fbcf9b4ff5a85edf9714db> /ModDate <d08dc01baee40bb7d7428c7ad217be950d7482caccb3> /Producer <fbcf9b4ff5a85edf9714db68951ca193087092c5b1ca44b3> /Title <fbcf9b4ff5a85ead9714db688641ecd15f34c68493ed30f3c6f2b68d30249349fd40b4> /oxidize-pdf-build <fbcf824ffaff0ce584448429d24bb8c0477383dbc8b1> /oxidize-pdf-edition <dbc79745cfbd4ef28415> /oxidize-pdf-features <a485c21b> >>
+endobj
+3 0 obj
+<< /Subtype /XML /Type /Metadata /Length 2799 >>
+stream
+<?xpacket begin="Ôªø" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="oxidize-pdf 1.4.0">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+        xmlns:dc="http://purl.org/dc/elements/1.1/"
+        xmlns:pdf="http://ns.adobe.com/pdf/1.3/"
+        xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <dc:title>oxidize-pdf encryption interop base</dc:title>
+      <dc:creator>oxidize-pdf</dc:creator>
+      <xmp:CreatorTool>oxidize_pdf</xmp:CreatorTool>
+      <xmp:CreateDate>2026-01-01T00:00:00+00:00</xmp:CreateDate>
+      <xmp:ModifyDate>2026-07-02T12:18:16.292652620+00:00</xmp:ModifyDate>
+      <pdf:Producer>oxidize_pdf v3.0.4 (MIT)</pdf:Producer>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                endstream
+endobj
+4 0 obj
+<< /Count 1 /Kids [ 5 0 R ] /Type /Pages >>
+endobj
+5 0 obj
+<< /Contents 6 0 R /MediaBox [ 0 0 595 842 ] /Parent 4 0 R /Resources << /Font << /Courier << /BaseFont /Courier /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Courier-Bold << /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Courier-BoldOblique << /BaseFont /Courier-BoldOblique /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Courier-Oblique << /BaseFont /Courier-Oblique /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Helvetica << /BaseFont /Helvetica /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Helvetica-Bold << /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Helvetica-BoldOblique << /BaseFont /Helvetica-BoldOblique /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Helvetica-Oblique << /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Times-Bold << /BaseFont /Times-Bold /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Times-BoldItalic << /BaseFont /Times-BoldItalic /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Times-Italic << /BaseFont /Times-Italic /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> /Times-Roman << /BaseFont /Times-Roman /Encoding /WinAnsiEncoding /Subtype /Type1 /Type /Font >> >> >> /Type /Page >>
+endobj
+6 0 obj
+<< /Filter /FlateDecode /Length 156 >>
+stream
+^ﬂ>Ãê˙˙ô†ijJ#ÌÆâ€í33©Bw&©cfıK-Ò'M’N$né ÂŒˇ∆Û[®¶M	AöÔ∑|Å±˛oâV¸`ÂØ™ß◊D€#x–≠€‡ø°[ÛÛdÎr–…PL§Ã“ı˙…ÌÜGZÚä|Íp˜?(]übñ¨::´´’8üê≠·éòÔ”[ä*˘#5ˆendstream
+endobj
+7 0 obj
+<< /CF << /StdCF << /AuthEvent /DocOpen /CFM /V2 /Length 16 >> >> /EncryptMetadata false /Filter /Standard /Length 128 /O <5a0c0b55deda723d6a1a77ca020e0bf91273d02733c4748c700d9eb9a6d68a09> /P -4 /R 4 /StmF /StdCF /StrF /StdCF /U <b7ce18ba222e3d658aa1864c5a5430e10122456a91bae5134273a6db134c87c4> /V 4 >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000080 00000 n 
+0000000569 00000 n 
+0000003449 00000 n 
+0000003508 00000 n 
+0000004852 00000 n 
+0000005079 00000 n 
+trailer << /Info 2 0 R /Root 1 0 R /Size 8 /ID [<d2d8e4ee5a84af01a7e5a7a1ec29a27a><d2d8e4ee5a84af01a7e5a7a1ec29a27a>] /Encrypt 7 0 R >>
+startxref
+5398
+%%EOF

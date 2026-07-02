@@ -206,8 +206,29 @@ impl StandardSecurityHandler {
         permissions: Permissions,
         file_id: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
+        self.compute_user_hash_with_metadata(user_password, owner_hash, permissions, file_id, true)
+    }
+
+    /// Compute the user password hash (`/U`). Mirrors [`compute_user_hash`](Self::compute_user_hash)
+    /// but threads the document's `/EncryptMetadata` flag into the key
+    /// derivation, so the `/U` verifier matches on cleartext-metadata files
+    /// (issue #379).
+    pub(crate) fn compute_user_hash_with_metadata(
+        &self,
+        user_password: &UserPassword,
+        owner_hash: &[u8],
+        permissions: Permissions,
+        file_id: Option<&[u8]>,
+        encrypt_metadata: bool,
+    ) -> Result<Vec<u8>> {
         // Compute encryption key
-        let key = self.compute_encryption_key(user_password, owner_hash, permissions, file_id)?;
+        let key = self.compute_encryption_key_with_metadata(
+            user_password,
+            owner_hash,
+            permissions,
+            file_id,
+            encrypt_metadata,
+        )?;
 
         match self.revision {
             SecurityHandlerRevision::R2 => {
@@ -268,6 +289,32 @@ impl StandardSecurityHandler {
         permissions: Permissions,
         file_id: Option<&[u8]>,
     ) -> Result<EncryptionKey> {
+        // Public entry point: assumes metadata is encrypted (the historical
+        // default). The parser routes through `compute_encryption_key_with_metadata`
+        // to honour the document's /EncryptMetadata flag (issue #379).
+        self.compute_encryption_key_with_metadata(
+            user_password,
+            owner_hash,
+            permissions,
+            file_id,
+            true,
+        )
+    }
+
+    /// Compute the file encryption key (ISO 32000-1 §7.6.3.3, Algorithm 2).
+    ///
+    /// `encrypt_metadata` is the document's `/EncryptMetadata` value. Per step
+    /// (f), when it is false and the revision is 4+, four `0xFF` bytes are
+    /// appended to the MD5 input; skipping them derives the wrong key, so no
+    /// password — not even the empty one — authenticates (issue #379).
+    pub(crate) fn compute_encryption_key_with_metadata(
+        &self,
+        user_password: &UserPassword,
+        owner_hash: &[u8],
+        permissions: Permissions,
+        file_id: Option<&[u8]>,
+        encrypt_metadata: bool,
+    ) -> Result<EncryptionKey> {
         match self.revision {
             SecurityHandlerRevision::R5 | SecurityHandlerRevision::R6 => {
                 // For AES revisions, use AES-specific key computation
@@ -288,10 +335,12 @@ impl StandardSecurityHandler {
                     data.extend_from_slice(id);
                 }
 
-                // For R4 with metadata not encrypted, add extra bytes
-                if self.revision == SecurityHandlerRevision::R4 {
-                    // In a full implementation, check EncryptMetadata flag
-                    // For now, assume metadata is encrypted
+                // ISO 32000-1 Algorithm 2, step (f): when metadata is not
+                // encrypted, append 0xFFFFFFFF before hashing. The revision gate
+                // (R >= 4) is applied by the caller: `self.revision` here is a
+                // cipher proxy (R4-with-RC4 reports R3), so it cannot gate this.
+                if !encrypt_metadata {
+                    data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
                 }
 
                 // Step 3: Create MD5 hash

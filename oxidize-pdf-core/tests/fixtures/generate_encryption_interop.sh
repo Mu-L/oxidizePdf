@@ -23,10 +23,13 @@
 #
 # Matrix: {rc4-40, rc4-128, aes128, aes256r5, aes256r6} x {user, empty}
 #         plus {aes256r5, aes256r6} x {unicode}
+#         plus {rc4-128, aes128}   x {ctm_user, ctm_empty}
 #   user    : user password 'userpw', owner password 'ownerpw'  (distinct)
 #   empty   : user password ''       , owner password 'ownerpw'
 #   unicode : non-ASCII user + owner passwords (exercises SASLprep normalization,
 #             the usual R5/R6 interop break; foco de #380)
+#   ctm     : EncryptMetadata=false (cleartext metadata, qpdf upgrades to R4);
+#             reproduces #379 — Algorithm 2 must append 0xFFFFFFFF to the key MD5
 # The 'empty' files reproduce #379 (empty-user auto-unlock). Every file has a
 # distinct non-empty owner password, so owner-unlock (#380) is testable on all.
 #
@@ -92,6 +95,16 @@ gen interop_qpdf_aes256r6_empty.pdf --encrypt "" "$OWNER_PW" 256
 gen interop_qpdf_aes256r5_unicode.pdf --encrypt "$UNICODE_USER" "$UNICODE_OWNER" 256 --force-R5
 gen interop_qpdf_aes256r6_unicode.pdf --encrypt "$UNICODE_USER" "$UNICODE_OWNER" 256
 
+# --- cleartext-metadata variants (EncryptMetadata=false; #379) ---
+# qpdf upgrades these to V4/R4. Algorithm 2 must append 0xFFFFFFFF to the key
+# MD5 when metadata is not encrypted; a reader that skips it derives the wrong
+# key and fails to unlock even the empty user password. RC4 and AES ciphers,
+# empty and non-empty user, all under R4.
+gen interop_qpdf_rc4-128_ctm_empty.pdf --allow-weak-crypto --encrypt "" "$OWNER_PW" 128 --use-aes=n --cleartext-metadata
+gen interop_qpdf_rc4-128_ctm_user.pdf  --allow-weak-crypto --encrypt "$USER_PW" "$OWNER_PW" 128 --use-aes=n --cleartext-metadata
+gen interop_qpdf_aes128_ctm_empty.pdf  --encrypt "" "$OWNER_PW" 128 --use-aes=y --cleartext-metadata
+gen interop_qpdf_aes128_ctm_user.pdf   --encrypt "$USER_PW" "$OWNER_PW" 128 --use-aes=y --cleartext-metadata
+
 echo ""
 echo "=== Verifying revision (R) per file ==="
 for f in interop_qpdf_*.pdf; do
@@ -119,6 +132,10 @@ for c in rc4-40 rc4-128 aes128 aes256r5 aes256r6; do
 done
 check_marker interop_qpdf_aes256r5_unicode.pdf -upw "$UNICODE_USER"
 check_marker interop_qpdf_aes256r6_unicode.pdf -upw "$UNICODE_USER"
+for c in rc4-128 aes128; do
+    check_marker "interop_qpdf_${c}_ctm_user.pdf"  -upw "$USER_PW"
+    check_marker "interop_qpdf_${c}_ctm_empty.pdf"
+done
 
 echo ""
 echo "All fixtures generated and content-verified."

@@ -42,6 +42,13 @@ pub struct EncryptionInfo {
     ///
     /// `pub(crate)`: internal cipher-selection input, not part of the public API.
     pub(crate) cfm: Option<String>,
+    /// `/EncryptMetadata` flag (default true). When false and R >= 4, Algorithm 2
+    /// appends 0xFFFFFFFF to the key MD5 (ISO 32000-1 §7.6.3.3, step f). Real
+    /// producers often leave metadata in cleartext; honouring this is required
+    /// to unlock those files, even with the empty user password (issue #379).
+    ///
+    /// `pub(crate)`: internal key-derivation input, not part of the public API.
+    pub(crate) encrypt_metadata: bool,
 }
 
 /// PDF Encryption Handler
@@ -174,6 +181,13 @@ impl EncryptionHandler {
             None
         };
 
+        // Get EncryptMetadata (default true). Only meaningful for R >= 4; older
+        // revisions always encrypt metadata.
+        let encrypt_metadata = dict
+            .get("EncryptMetadata")
+            .and_then(|obj| obj.as_bool())
+            .unwrap_or(true);
+
         Ok(EncryptionInfo {
             filter: filter.to_string(),
             v,
@@ -185,6 +199,7 @@ impl EncryptionHandler {
             ue,
             oe,
             cfm,
+            encrypt_metadata,
         })
     }
 
@@ -231,13 +246,20 @@ impl EncryptionHandler {
     fn unlock_user_r2_r4(&mut self, user_password: &UserPassword) -> ParseResult<bool> {
         let permissions = Permissions::from_bits(self.encryption_info.p as u32);
 
+        // The /EncryptMetadata 0xFFFFFFFF append (Algorithm 2, step f) applies
+        // only for R >= 4; older revisions always encrypt metadata. Gate on the
+        // document revision here — the security handler's revision is a cipher
+        // proxy (R4-with-RC4 reports R3).
+        let encrypt_metadata = self.encryption_info.encrypt_metadata || self.encryption_info.r < 4;
+
         let computed_u = self
             .security_handler
-            .compute_user_hash(
+            .compute_user_hash_with_metadata(
                 user_password,
                 &self.encryption_info.o,
                 permissions,
                 self.file_id.as_deref(),
+                encrypt_metadata,
             )
             .map_err(|e| ParseError::SyntaxError {
                 position: 0,
@@ -258,11 +280,12 @@ impl EncryptionHandler {
         if matches {
             let key = self
                 .security_handler
-                .compute_encryption_key(
+                .compute_encryption_key_with_metadata(
                     user_password,
                     &self.encryption_info.o,
                     permissions,
                     self.file_id.as_deref(),
+                    encrypt_metadata,
                 )
                 .map_err(|e| ParseError::SyntaxError {
                     position: 0,
@@ -573,11 +596,9 @@ impl EncryptionHandler {
         true
     }
 
-    /// Check if metadata should be encrypted (R4 only)
+    /// Whether document metadata is encrypted (`/EncryptMetadata`, default true).
     pub fn encrypt_metadata(&self) -> bool {
-        // For R4, this could be controlled by EncryptMetadata entry
-        // For now, assume metadata is encrypted
-        true
+        self.encryption_info.encrypt_metadata
     }
 }
 
