@@ -1414,6 +1414,28 @@ impl<R: Read + Seek> PdfDocument<R> {
         Ok(self.build_rag_chunks(&hybrid_chunks, None))
     }
 
+    /// Extract and chunk with a custom [`TokenCounter`](crate::pipeline::TokenCounter).
+    ///
+    /// Identical to [`rag_chunks_with`](Self::rag_chunks_with) except the injected
+    /// counter governs both the chunk split/size decisions and the reported
+    /// `token_estimate` on each [`RagChunk`](crate::pipeline::RagChunk). Use with
+    /// [`TiktokenCounter`](crate::pipeline::TiktokenCounter) (feature `tiktoken`)
+    /// to size chunks against a real subword tokenizer.
+    ///
+    /// Note: this flows through [`HybridChunker`](crate::pipeline::HybridChunker).
+    /// The `unstable-spi` pipeline entry points (`rag_chunks_with_pipeline` /
+    /// `rag_chunks_from_elements`) remain word-proxy only.
+    pub fn rag_chunks_with_counter(
+        &self,
+        config: crate::pipeline::HybridChunkConfig,
+        counter: std::sync::Arc<dyn crate::pipeline::TokenCounter>,
+    ) -> ParseResult<Vec<crate::pipeline::RagChunk>> {
+        let elements = self.partition()?;
+        let chunker = crate::pipeline::HybridChunker::new(config).with_token_counter(counter);
+        let hybrid_chunks = chunker.chunk(&elements);
+        Ok(self.build_rag_chunks(&hybrid_chunks, None))
+    }
+
     /// Build RAG chunks stamped with source-document metadata.
     ///
     /// Auto-fills `title`/`author`/`creation_date`/`total_pages` from the info
