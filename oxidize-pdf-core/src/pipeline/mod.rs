@@ -33,4 +33,6 @@ pub use spi::{
 };
 #[cfg(all(feature = "unstable-spi", feature = "semantic"))]
 pub use spi::{EnrichContext, MetadataEnricher};
+#[cfg(feature = "tiktoken")]
+pub use token_counter::TiktokenCounter;
 pub use token_counter::{TokenCounter, WordProxyCounter};

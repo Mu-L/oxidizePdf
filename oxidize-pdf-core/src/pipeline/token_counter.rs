@@ -23,6 +23,33 @@ impl TokenCounter for WordProxyCounter {
     }
 }
 
+/// Real token counter backed by tiktoken's cl100k_base BPE (GPT-3.5/4 family).
+#[cfg(feature = "tiktoken")]
+pub struct TiktokenCounter {
+    bpe: tiktoken_rs::CoreBPE,
+}
+
+#[cfg(feature = "tiktoken")]
+impl TiktokenCounter {
+    /// Load the cl100k_base BPE rank tables (embedded in the crate; infallible
+    /// in practice — the tables ship with `tiktoken-rs`).
+    pub fn cl100k_base() -> Self {
+        Self {
+            bpe: tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer tables"),
+        }
+    }
+}
+
+#[cfg(feature = "tiktoken")]
+impl TokenCounter for TiktokenCounter {
+    fn count(&self, text: &str) -> usize {
+        self.bpe.encode_ordinary(text).len()
+    }
+    fn name(&self) -> &'static str {
+        "cl100k_base"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -35,5 +62,34 @@ mod tests {
         assert_eq!(c.count("  multiple   spaces  "), 2);
         assert_eq!(c.count("punct, and! more?"), 3);
         assert_eq!(c.name(), "word-proxy");
+    }
+}
+
+#[cfg(all(test, feature = "tiktoken"))]
+mod tiktoken_tests {
+    use super::*;
+
+    #[test]
+    fn cl100k_exact_reference_counts() {
+        let c = TiktokenCounter::cl100k_base();
+        // Pinned cl100k_base values (OpenAI reference tokenizer).
+        assert_eq!(c.count(""), 0);
+        assert_eq!(c.count("hello world"), 2);
+        assert_eq!(c.count("The quick brown fox"), 4);
+        assert_eq!(c.name(), "cl100k_base");
+    }
+
+    #[test]
+    fn cl100k_diverges_from_word_proxy_on_subword() {
+        let tk = TiktokenCounter::cl100k_base();
+        let wp = WordProxyCounter;
+        // A URL is one whitespace "word" but many BPE tokens.
+        let url = "https://example.com/verify";
+        assert_eq!(wp.count(url), 1);
+        assert!(
+            tk.count(url) > 1,
+            "tiktoken should split the URL: {}",
+            tk.count(url)
+        );
     }
 }
