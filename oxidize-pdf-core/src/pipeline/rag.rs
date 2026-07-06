@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// - `text`: raw chunk text for display or keyword search
 /// - `full_text`: heading context + text — **use this for embedding generation**
-/// - `token_estimate`: word-count proxy (multiply by ~1.5 for subword tokens)
+/// - `token_estimate`: token count under the chunker's active `TokenCounter`
+///   (word-count proxy by default; a real tokenizer such as cl100k_base when a
+///   counter is injected via `rag_chunks_with_counter`). Query the counter's
+///   `name()` for provenance.
 /// - `is_oversized`: true when a single element exceeds `max_tokens`
 ///
 /// # Example
@@ -60,13 +63,10 @@ pub struct RagChunk {
     pub element_types: Vec<String>,
     /// Heading context inherited from the nearest parent heading.
     pub heading_context: Option<String>,
-    /// Approximate token count (word-count proxy).
-    ///
-    /// Computed as the number of whitespace-separated words. LLM subword
-    /// tokenizers (BPE/WordPiece) typically produce 1.3–1.7x more tokens
-    /// than the raw word count. Size your chunk budget accordingly: a
-    /// `max_tokens: 512` setting corresponds to roughly 300–390 actual
-    /// subword tokens for typical English prose.
+    /// Token count under the chunker's active `TokenCounter` (word-count
+    /// proxy by default; a real tokenizer such as cl100k_base when a counter
+    /// is injected via `rag_chunks_with_counter`). Query the counter's
+    /// `name()` for provenance.
     pub token_estimate: usize,
     /// Whether the chunk exceeds the configured `max_tokens`.
     pub is_oversized: bool,
