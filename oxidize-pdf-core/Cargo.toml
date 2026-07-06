@@ -492,7 +492,6 @@ token-bench = ["dep:tiktoken-rs", "semantic"]
 # Real token counting in the chunking path (pulls tiktoken-rs BPE tables).
 tiktoken = ["dep:tiktoken-rs"]
 
-
 [[example]]
 name = "ai_ready_invoice"
 path = "examples/ai_ready_invoice.rs"

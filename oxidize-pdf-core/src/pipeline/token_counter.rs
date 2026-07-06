@@ -62,6 +62,13 @@ mod tests {
         assert_eq!(c.count("  multiple   spaces  "), 2);
         assert_eq!(c.count("punct, and! more?"), 3);
         assert_eq!(c.name(), "word-proxy");
+
+        // Property: the default counter must stay identical to the historical
+        // `split_whitespace().count()` word-proxy — this is the byte-identity
+        // invariant the whole feature rests on (#377).
+        for s in ["", "a b c", "  x  y ", "line1\nline2\tthree", "único café"] {
+            assert_eq!(c.count(s), s.split_whitespace().count());
+        }
     }
 }
 

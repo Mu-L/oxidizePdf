@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 /// - `full_text`: heading context + text — **use this for embedding generation**
 /// - `token_estimate`: token count under the chunker's active `TokenCounter`
 ///   (word-count proxy by default; a real tokenizer such as cl100k_base when a
-///   counter is injected via `rag_chunks_with_counter`). Query the counter's
-///   `name()` for provenance.
+///   counter is injected via `rag_chunks_with_counter`). `RagChunk` does not
+///   store the counter; query the counter you injected via its `name()` for
+///   provenance.
 /// - `is_oversized`: true when a single element exceeds `max_tokens`
 ///
 /// # Example
@@ -65,8 +66,8 @@ pub struct RagChunk {
     pub heading_context: Option<String>,
     /// Token count under the chunker's active `TokenCounter` (word-count
     /// proxy by default; a real tokenizer such as cl100k_base when a counter
-    /// is injected via `rag_chunks_with_counter`). Query the counter's
-    /// `name()` for provenance.
+    /// is injected via `rag_chunks_with_counter`). `RagChunk` does not store
+    /// the counter; query the counter you injected via its `name()`.
     pub token_estimate: usize,
     /// Whether the chunk exceeds the configured `max_tokens`.
     pub is_oversized: bool,
