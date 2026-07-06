@@ -10,6 +10,7 @@ pub mod reading_order;
 pub mod semantic_chunking;
 #[cfg(feature = "unstable-spi")]
 pub mod spi;
+pub mod token_counter;
 
 #[cfg(feature = "language-detection")]
 pub use chunk_metadata::detect_language;
@@ -32,3 +33,6 @@ pub use spi::{
 };
 #[cfg(all(feature = "unstable-spi", feature = "semantic"))]
 pub use spi::{EnrichContext, MetadataEnricher};
+#[cfg(feature = "tiktoken")]
+pub use token_counter::TiktokenCounter;
+pub use token_counter::{TokenCounter, WordProxyCounter};
