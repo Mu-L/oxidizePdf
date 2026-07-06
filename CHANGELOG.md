@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+## [3.1.0] - 2026-07-06
+
+### Added
+
+- `TokenCounter` trait (`pipeline::token_counter`) with a zero-dependency
+  `WordProxyCounter` default and a feature-gated `TiktokenCounter` (cl100k_base,
+  behind the new `tiktoken` feature). `HybridChunker`/`SemanticChunker` gain
+  `with_token_counter(..)`; each chunk stamps its `token_estimate` with the
+  active counter, and `PdfDocument::rag_chunks_with_counter(config, counter)`
+  injects a counter into the RAG path. The default build is byte-identical
+  (word-proxy) and pulls no new dependency (#377).
+- `ExtractionOptions.reorder_columns` (opt-in, default `false`): on the flat
+  text path (`preserve_layout = false`), reorders output by column so
+  per-column tokens stay adjacent in multi-column tables (emails/phones split
+  across draw operators become detectable again). Reuses the existing
+  column-detection machinery; `.fragments` stays empty; default off is
+  byte-identical (#389).
+
+### Fixed
+
+- Flat-text extraction no longer glues the last word of one visual line to the
+  first word of the next when the line height is below `newline_threshold` and
+  the line wraps back to the left: a large backward horizontal jump is now
+  treated as a line break in both the `Tj` and `TJ` handlers (#390).
+
 ## [3.0.4] - 2026-06-29
 
 ### Changed
