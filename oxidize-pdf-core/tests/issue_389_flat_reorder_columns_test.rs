@@ -102,3 +102,53 @@ fn reorder_columns_preserves_wide_tj_kern_space() {
         "wide TJ kern must stay a space under reorder_columns, not concatenate: {text:?}"
     );
 }
+
+#[test]
+fn default_flat_still_interleaves_columns() {
+    // Documents the pre-fix behaviour and proves the flag is the switch: with
+    // reorder_columns OFF (default), the col1 email is still broken by col2.
+    let text = extract(TWO_COL_EMAILS, ExtractionOptions::default()).text;
+    assert!(
+        !text.contains("user@example.com"),
+        "default flat must remain stream-order (broken email): {text:?}"
+    );
+}
+
+#[test]
+fn reorder_columns_leaves_fragments_empty() {
+    // Contract: reorder_columns fixes only `.text`; `.fragments` stays empty in
+    // flat mode (populated only under preserve_layout).
+    let opts = ExtractionOptions {
+        reorder_columns: true,
+        ..Default::default()
+    };
+    let result = extract(TWO_COL_EMAILS, opts);
+    assert!(
+        result.fragments.is_empty(),
+        "flat + reorder_columns must not expose fragments"
+    );
+}
+
+#[test]
+fn single_column_reorder_matches_plain_flat() {
+    // A single-column doc: no column boundary is detected, so reorder_columns
+    // must not split or reorder — the wrapped lines stay in reading order.
+    const ONE_COL: &str = concat!(
+        "BT\n/F1 10 Tf\n",
+        "1 0 0 1 50 700 Tm\n[(alpha beta)] TJ\n",
+        "1 0 0 1 50 680 Tm\n[(gamma delta)] TJ\nET"
+    );
+    let opts = ExtractionOptions {
+        reorder_columns: true,
+        ..Default::default()
+    };
+    let text = extract(ONE_COL, opts).text;
+    // Both lines present, in reading order, words within each line intact.
+    let a = text.find("alpha").expect("alpha present");
+    let g = text.find("gamma").expect("gamma present");
+    assert!(a < g, "reading order preserved for single column: {text:?}");
+    assert!(
+        text.contains("alpha beta") && text.contains("gamma delta"),
+        "words within each line stay intact: {text:?}"
+    );
+}
