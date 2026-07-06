@@ -68,6 +68,14 @@ pub struct ExtractionOptions {
     /// (issue #269 Phase 1). Opt-in by setting `true` when extracting
     /// page furniture matters (e.g. forensic auditing, redaction tools).
     pub include_artifacts: bool,
+    /// Reorder flat-text output by column so per-column tokens stay adjacent in
+    /// multi-column layouts (issue #389). Only affects the flat path
+    /// (`preserve_layout = false`); in layout mode `detect_columns` already
+    /// reorders. Default `false` → the flat path is byte-identical to before.
+    /// When on, `.text` is produced by the fragment pipeline (its shape matches
+    /// the layout path's reconstruction, not stream order); `.fragments` stays
+    /// empty.
+    pub reorder_columns: bool,
 }
 
 impl Default for ExtractionOptions {
@@ -84,6 +92,7 @@ impl Default for ExtractionOptions {
             track_space_decisions: false,
             reconstruct_paragraphs: false,
             include_artifacts: false,
+            reorder_columns: false,
         }
     }
 }
@@ -780,6 +789,22 @@ impl TextExtractor {
             if self.options.preserve_layout && !fragments.is_empty() {
                 extracted_text = self.reconstruct_text_from_fragments(&fragments);
             }
+
+            // Flat path with column reordering (issue #389): fragments were
+            // collected only to reorder. `sort_and_merge_fragments` already ran
+            // at the top of this block (sort_by_position defaults true) and now
+            // applies column clustering via the gate above; call it here too so
+            // the behaviour is independent of `sort_by_position`, then rebuild
+            // the flat text from the reordered fragments and drop them (the
+            // `.fragments` contract only exposes fragments under preserve_layout).
+            if self.options.reorder_columns
+                && !self.options.preserve_layout
+                && !fragments.is_empty()
+            {
+                self.sort_and_merge_fragments(&mut fragments);
+                extracted_text = self.reconstruct_text_from_fragments(&fragments);
+                fragments.clear();
+            }
         }
 
         Ok(ExtractedText {
@@ -910,7 +935,7 @@ impl TextExtractor {
                             )
                         };
 
-                        if self.options.preserve_layout {
+                        if self.options.preserve_layout || self.options.reorder_columns {
                             emit_text_fragment(
                                 &mut fragments,
                                 &decoded,
@@ -985,7 +1010,8 @@ impl TextExtractor {
                                         )
                                     };
 
-                                    if self.options.preserve_layout {
+                                    if self.options.preserve_layout || self.options.reorder_columns
+                                    {
                                         emit_text_fragment(
                                             &mut fragments,
                                             &decoded,
@@ -1098,7 +1124,7 @@ impl TextExtractor {
                             )
                         };
 
-                        if self.options.preserve_layout {
+                        if self.options.preserve_layout || self.options.reorder_columns {
                             emit_text_fragment(
                                 &mut fragments,
                                 &decoded,
@@ -1155,7 +1181,7 @@ impl TextExtractor {
                             )
                         };
 
-                        if self.options.preserve_layout {
+                        if self.options.preserve_layout || self.options.reorder_columns {
                             emit_text_fragment(
                                 &mut fragments,
                                 &decoded,
@@ -1308,7 +1334,9 @@ impl TextExtractor {
                         // If we just closed the scope that opened the pending run, flush it.
                         if pending.stack_depth + 1 == popped_depth {
                             let run = state.pending_actualtext.take().unwrap();
-                            if run.populated && self.options.preserve_layout {
+                            if run.populated
+                                && (self.options.preserve_layout || self.options.reorder_columns)
+                            {
                                 let (mcid, struct_tag) = innermost_mc_tag(&state.mc_stack);
                                 let in_artifact = state.mc_stack.iter().any(|e| e.is_artifact);
                                 if !in_artifact || self.options.include_artifacts {
@@ -1504,7 +1532,7 @@ impl TextExtractor {
         });
 
         // Detect columns if requested
-        if self.options.detect_columns {
+        if self.options.detect_columns || self.options.reorder_columns {
             self.detect_and_sort_columns(fragments);
         }
     }
@@ -2476,6 +2504,7 @@ mod tests {
             track_space_decisions: false,
             reconstruct_paragraphs: false,
             include_artifacts: false,
+            reorder_columns: false,
         };
         assert!(options.preserve_layout);
         assert_eq!(options.space_threshold, 0.5);
@@ -2676,6 +2705,7 @@ mod tests {
             track_space_decisions: false,
             reconstruct_paragraphs: false,
             include_artifacts: false,
+            reorder_columns: false,
         };
         let extractor = TextExtractor::with_options(options.clone());
         assert_eq!(extractor.options.preserve_layout, options.preserve_layout);
