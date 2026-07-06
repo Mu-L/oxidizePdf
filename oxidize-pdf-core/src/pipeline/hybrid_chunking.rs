@@ -1,5 +1,7 @@
 use crate::pipeline::graph::ElementGraph;
+use crate::pipeline::token_counter::{TokenCounter, WordProxyCounter};
 use crate::pipeline::{Element, ElementData, ElementMetadata};
+use std::sync::Arc;
 
 /// Policy for which adjacent element types can be merged into a single chunk.
 ///
@@ -88,6 +90,9 @@ pub struct HybridChunk {
     /// The heading context for this chunk (from `parent_heading` of its elements).
     pub heading_context: Option<String>,
     oversized: bool,
+    /// Token count stamped at construction by the chunker's active counter,
+    /// computed once over the whole chunk text. Returned by `token_estimate()`.
+    token_estimate: usize,
 }
 
 impl HybridChunk {
@@ -114,9 +119,10 @@ impl HybridChunk {
         }
     }
 
-    /// Approximate token count (word count proxy).
+    /// Token count under the counter that produced this chunk (word-proxy by
+    /// default; the chunker's injected `TokenCounter` otherwise).
     pub fn token_estimate(&self) -> usize {
-        estimate_tokens(&self.text())
+        self.token_estimate
     }
 
     /// Whether this chunk exceeds max_tokens (e.g., a large table).
@@ -145,11 +151,15 @@ impl HybridChunk {
             .map(|e| e.display_text())
             .collect::<Vec<_>>()
             .join("\n");
-        let oversized = estimate_tokens(&text) > max_tokens;
+        // The SPI pipeline path is word-proxy only (#377 resolution C): it has no
+        // HybridChunker instance to carry an injected counter.
+        let token_estimate = WordProxyCounter.count(&text);
+        let oversized = token_estimate > max_tokens;
         HybridChunk {
             elements: group.elements,
             heading_context: group.heading_context,
             oversized,
+            token_estimate,
         }
     }
 }
@@ -186,19 +196,53 @@ impl HybridChunk {
 /// ```
 pub struct HybridChunker {
     config: HybridChunkConfig,
+    counter: Arc<dyn TokenCounter>,
 }
 
 impl Default for HybridChunker {
     fn default() -> Self {
         Self {
             config: HybridChunkConfig::default(),
+            counter: Arc::new(WordProxyCounter),
         }
     }
 }
 
 impl HybridChunker {
     pub fn new(config: HybridChunkConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            counter: Arc::new(WordProxyCounter),
+        }
+    }
+
+    /// Inject a token counter governing split/oversize decisions and the stamped
+    /// per-chunk `token_estimate`. Default is `WordProxyCounter`.
+    pub fn with_token_counter(mut self, counter: Arc<dyn TokenCounter>) -> Self {
+        self.counter = counter;
+        self
+    }
+
+    /// Build a chunk, stamping its token count once over the whole chunk text
+    /// with the active counter.
+    fn make_chunk(
+        &self,
+        elements: Vec<Element>,
+        heading_context: Option<String>,
+        oversized: bool,
+    ) -> HybridChunk {
+        let text = elements
+            .iter()
+            .map(|e| e.display_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let token_estimate = self.counter.count(&text);
+        HybridChunk {
+            elements,
+            heading_context,
+            oversized,
+            token_estimate,
+        }
     }
 
     /// Chunk a list of elements into hybrid chunks.
@@ -213,7 +257,7 @@ impl HybridChunker {
         let mut buffer_heading: Option<String> = None;
 
         for element in elements {
-            let elem_tokens = estimate_tokens(&element.display_text());
+            let elem_tokens = self.counter.count(&element.display_text());
             let elem_heading = if self.config.propagate_headings {
                 element.metadata().parent_heading.clone()
             } else {
@@ -256,22 +300,19 @@ impl HybridChunker {
             if elem_tokens > self.config.max_tokens && buffer.is_empty() {
                 if is_splittable_element(element) {
                     let text = element.display_text();
-                    let fragments = split_by_sentences(&text, self.config.max_tokens);
+                    let fragments =
+                        split_by_sentences(&text, self.counter.as_ref(), self.config.max_tokens);
                     for fragment in fragments {
                         let fragment_element = make_text_fragment_element(element, fragment.trim());
-                        chunks.push(HybridChunk {
-                            elements: vec![fragment_element],
-                            heading_context: elem_heading.clone(),
-                            oversized: false,
-                        });
+                        chunks.push(self.make_chunk(
+                            vec![fragment_element],
+                            elem_heading.clone(),
+                            false,
+                        ));
                     }
                 } else {
                     // Table, image, code: atomic oversized chunk
-                    chunks.push(HybridChunk {
-                        elements: vec![element.clone()],
-                        heading_context: elem_heading,
-                        oversized: true,
-                    });
+                    chunks.push(self.make_chunk(vec![element.clone()], elem_heading, true));
                 }
                 continue;
             }
@@ -286,11 +327,7 @@ impl HybridChunker {
 
         // Flush remaining
         if !buffer.is_empty() {
-            chunks.push(HybridChunk {
-                elements: std::mem::take(&mut buffer),
-                heading_context: buffer_heading,
-                oversized: false,
-            });
+            chunks.push(self.make_chunk(std::mem::take(&mut buffer), buffer_heading, false));
         }
 
         chunks
@@ -344,16 +381,12 @@ impl HybridChunker {
 
             let section_tokens: usize = section_elements
                 .iter()
-                .map(|e| estimate_tokens(&e.display_text()))
+                .map(|e| self.counter.count(&e.display_text()))
                 .sum();
 
             if section_tokens <= self.config.max_tokens {
                 // Entire section fits in one chunk.
-                chunks.push(HybridChunk {
-                    elements: section_elements,
-                    heading_context: title_heading,
-                    oversized: false,
-                });
+                chunks.push(self.make_chunk(section_elements, title_heading, false));
             } else {
                 // Section is too large — split with standard chunker, then fix heading.
                 let mut sub_chunks = self.chunk(&section_elements);
@@ -386,17 +419,8 @@ impl HybridChunker {
         let heading = buffer_heading.take();
         *buffer_tokens = 0;
 
-        chunks.push(HybridChunk {
-            elements: flushed,
-            heading_context: heading,
-            oversized: false,
-        });
+        chunks.push(self.make_chunk(flushed, heading, false));
     }
-}
-
-/// Simple token estimator: word count (split by whitespace).
-fn estimate_tokens(text: &str) -> usize {
-    text.split_whitespace().count()
 }
 
 /// Whether two adjacent elements can be merged according to the given policy.
@@ -426,10 +450,10 @@ fn is_splittable_element(e: &Element) -> bool {
 }
 
 /// Split text at sentence boundaries (`. `, `! `, `? `, `\n`) into fragments of at most
-/// `max_tokens` words. Greedily accumulates sentences; if a single sentence still exceeds
-/// `max_tokens`, it is emitted as a single fragment (cannot split further without a
-/// semantic break). Never returns an empty Vec.
-fn split_by_sentences(text: &str, max_tokens: usize) -> Vec<String> {
+/// `max_tokens` tokens under `counter`. Greedily accumulates sentences; if a single
+/// sentence still exceeds `max_tokens`, it is emitted as a single fragment (cannot split
+/// further without a semantic break). Never returns an empty Vec.
+fn split_by_sentences(text: &str, counter: &dyn TokenCounter, max_tokens: usize) -> Vec<String> {
     // Split into sentences preserving the delimiter as part of the sentence.
     let sentences = split_into_sentences(text);
 
@@ -442,7 +466,7 @@ fn split_by_sentences(text: &str, max_tokens: usize) -> Vec<String> {
         if sentence.is_empty() {
             continue;
         }
-        let sentence_tokens = estimate_tokens(sentence);
+        let sentence_tokens = counter.count(sentence);
 
         if current.is_empty() {
             // Starting a new fragment

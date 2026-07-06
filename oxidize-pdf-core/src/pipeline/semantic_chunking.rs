@@ -1,4 +1,6 @@
+use crate::pipeline::token_counter::{TokenCounter, WordProxyCounter};
 use crate::pipeline::Element;
+use std::sync::Arc;
 
 /// Configuration for semantic chunking.
 #[derive(Debug, Clone)]
@@ -42,6 +44,7 @@ impl SemanticChunkConfig {
 pub struct SemanticChunk {
     elements: Vec<Element>,
     oversized: bool,
+    token_estimate: usize,
 }
 
 impl SemanticChunk {
@@ -59,9 +62,9 @@ impl SemanticChunk {
             .join("\n")
     }
 
-    /// Approximate token count (word count proxy).
+    /// Token count under the counter that produced this chunk.
     pub fn token_estimate(&self) -> usize {
-        estimate_tokens(&self.text())
+        self.token_estimate
     }
 
     /// Page numbers spanned by this chunk.
@@ -81,19 +84,63 @@ impl SemanticChunk {
 /// Semantic chunker that respects element boundaries.
 pub struct SemanticChunker {
     config: SemanticChunkConfig,
+    counter: Arc<dyn TokenCounter>,
 }
 
 impl Default for SemanticChunker {
     fn default() -> Self {
         Self {
             config: SemanticChunkConfig::default(),
+            counter: Arc::new(WordProxyCounter),
         }
     }
 }
 
 impl SemanticChunker {
     pub fn new(config: SemanticChunkConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            counter: Arc::new(WordProxyCounter),
+        }
+    }
+
+    /// Inject a token counter governing split/oversize decisions and the stamped
+    /// per-chunk `token_estimate`. Default is `WordProxyCounter`.
+    pub fn with_token_counter(mut self, counter: Arc<dyn TokenCounter>) -> Self {
+        self.counter = counter;
+        self
+    }
+
+    fn element_tokens(&self, element: &Element) -> usize {
+        self.counter.count(&element.display_text())
+    }
+
+    fn make_chunk(&self, elements: Vec<Element>, oversized: bool) -> SemanticChunk {
+        let text = elements
+            .iter()
+            .map(|e| e.display_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let token_estimate = self.counter.count(&text);
+        SemanticChunk {
+            elements,
+            oversized,
+            token_estimate,
+        }
+    }
+
+    fn make_paragraph_chunk(
+        &self,
+        text: &str,
+        meta: &crate::pipeline::ElementMetadata,
+    ) -> SemanticChunk {
+        self.make_chunk(
+            vec![Element::Paragraph(crate::pipeline::ElementData {
+                text: text.to_string(),
+                metadata: meta.clone(),
+            })],
+            false,
+        )
     }
 
     /// Chunk a list of elements into semantic chunks.
@@ -107,7 +154,7 @@ impl SemanticChunker {
         let mut current_tokens = 0usize;
 
         for element in elements {
-            let elem_tokens = element_token_count(element);
+            let elem_tokens = self.element_tokens(element);
 
             // Non-splittable elements (Table, Title, Header, Footer, Image)
             if !is_splittable(element) {
@@ -126,10 +173,7 @@ impl SemanticChunker {
 
                 // If element alone exceeds max_tokens, it gets its own oversized chunk
                 if elem_tokens > self.config.max_tokens && current_elements.is_empty() {
-                    chunks.push(SemanticChunk {
-                        elements: vec![element.clone()],
-                        oversized: true,
-                    });
+                    chunks.push(self.make_chunk(vec![element.clone()], true));
                     continue;
                 }
 
@@ -172,9 +216,9 @@ impl SemanticChunker {
                 let mut buf_tokens = 0;
 
                 for sentence in &sentences {
-                    let s_tokens = estimate_tokens(sentence);
+                    let s_tokens = self.counter.count(sentence);
                     if buf_tokens + s_tokens > self.config.max_tokens && !sentence_buf.is_empty() {
-                        chunks.push(make_paragraph_chunk(&sentence_buf, &meta));
+                        chunks.push(self.make_paragraph_chunk(&sentence_buf, &meta));
                         sentence_buf.clear();
                         buf_tokens = 0;
                     }
@@ -197,10 +241,7 @@ impl SemanticChunker {
 
         // Flush remaining
         if !current_elements.is_empty() {
-            chunks.push(SemanticChunk {
-                elements: current_elements,
-                oversized: false,
-            });
+            chunks.push(self.make_chunk(current_elements, false));
         }
 
         chunks
@@ -215,10 +256,7 @@ impl SemanticChunker {
         oversized: bool,
     ) {
         let flushed = std::mem::take(current_elements);
-        chunks.push(SemanticChunk {
-            elements: flushed.clone(),
-            oversized,
-        });
+        chunks.push(self.make_chunk(flushed.clone(), oversized));
 
         // Apply overlap: carry trailing elements from flushed chunk into the next
         if self.config.overlap_tokens > 0 {
@@ -227,7 +265,7 @@ impl SemanticChunker {
 
             // Walk backwards through flushed elements to collect overlap
             for elem in flushed.iter().rev() {
-                let t = element_token_count(elem);
+                let t = self.element_tokens(elem);
                 if overlap_tokens + t > self.config.overlap_tokens && !overlap_elements.is_empty() {
                     break;
                 }
@@ -250,16 +288,6 @@ fn is_splittable(element: &Element) -> bool {
         element,
         Element::Paragraph(_) | Element::ListItem(_) | Element::CodeBlock(_) | Element::KeyValue(_)
     )
-}
-
-/// Approximate token count for an element.
-fn element_token_count(element: &Element) -> usize {
-    estimate_tokens(&element.display_text())
-}
-
-/// Simple token estimator: word count (split by whitespace).
-fn estimate_tokens(text: &str) -> usize {
-    text.split_whitespace().count()
 }
 
 /// Split text into sentences.
@@ -286,14 +314,4 @@ fn split_sentences(text: &str) -> Vec<String> {
     }
 
     sentences
-}
-
-fn make_paragraph_chunk(text: &str, meta: &crate::pipeline::ElementMetadata) -> SemanticChunk {
-    SemanticChunk {
-        elements: vec![Element::Paragraph(crate::pipeline::ElementData {
-            text: text.to_string(),
-            metadata: meta.clone(),
-        })],
-        oversized: false,
-    }
 }

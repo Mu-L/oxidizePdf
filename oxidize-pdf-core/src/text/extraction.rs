@@ -68,6 +68,14 @@ pub struct ExtractionOptions {
     /// (issue #269 Phase 1). Opt-in by setting `true` when extracting
     /// page furniture matters (e.g. forensic auditing, redaction tools).
     pub include_artifacts: bool,
+    /// Reorder flat-text output by column so per-column tokens stay adjacent in
+    /// multi-column layouts (issue #389). Only affects the flat path
+    /// (`preserve_layout = false`); in layout mode `detect_columns` already
+    /// reorders. Default `false` → the flat path is byte-identical to before.
+    /// When on, `.text` is produced by the fragment pipeline (its shape matches
+    /// the layout path's reconstruction, not stream order); `.fragments` stays
+    /// empty.
+    pub reorder_columns: bool,
 }
 
 impl Default for ExtractionOptions {
@@ -84,6 +92,7 @@ impl Default for ExtractionOptions {
             track_space_decisions: false,
             reconstruct_paragraphs: false,
             include_artifacts: false,
+            reorder_columns: false,
         }
     }
 }
@@ -780,6 +789,22 @@ impl TextExtractor {
             if self.options.preserve_layout && !fragments.is_empty() {
                 extracted_text = self.reconstruct_text_from_fragments(&fragments);
             }
+
+            // Flat path with column reordering (issue #389): fragments were
+            // collected only to reorder. `sort_and_merge_fragments` already ran
+            // at the top of this block (sort_by_position defaults true) and now
+            // applies column clustering via the gate above; call it here too so
+            // the behaviour is independent of `sort_by_position`, then rebuild
+            // the flat text from the reordered fragments and drop them (the
+            // `.fragments` contract only exposes fragments under preserve_layout).
+            if self.options.reorder_columns
+                && !self.options.preserve_layout
+                && !fragments.is_empty()
+            {
+                self.sort_and_merge_fragments(&mut fragments);
+                extracted_text = self.reconstruct_text_from_fragments(&fragments);
+                fragments.clear();
+            }
         }
 
         Ok(ExtractedText {
@@ -875,7 +900,14 @@ impl TextExtractor {
                             let dx = x - last_x;
                             let dy = (y - last_y).abs();
 
-                            if dy > self.options.newline_threshold {
+                            // A large backward jump in x is a line wrap: the pen
+                            // returns to the left margin on a new line. When the
+                            // line height is below `newline_threshold` the dy check
+                            // alone misses it, so treat a backward dx beyond one
+                            // line-height (2× the threshold, conservative) as a
+                            // newline regardless of dy (issue #390).
+                            let line_wrap = dx < -(self.options.newline_threshold * 2.0);
+                            if dy > self.options.newline_threshold || line_wrap {
                                 extracted_text.push('\n');
                             } else if dx > self.options.space_threshold * state.font_size {
                                 extracted_text.push(' ');
@@ -903,7 +935,7 @@ impl TextExtractor {
                             )
                         };
 
-                        if self.options.preserve_layout {
+                        if self.options.preserve_layout || self.options.reorder_columns {
                             emit_text_fragment(
                                 &mut fragments,
                                 &decoded,
@@ -915,14 +947,11 @@ impl TextExtractor {
                             );
                         }
 
-                        // Update position for next text
-                        last_x = x + text_width;
+                        // Advance the text matrix and track the true post-advance
+                        // pen x (folds in Tz and CTM x-scale, issue #386). `last_y`
+                        // stays the shown-text origin y for line detection.
+                        last_x = advance_pen(&mut state, text_width);
                         last_y = y;
-
-                        // Update text matrix for next show operation
-                        let tx = text_width * state.horizontal_scale / 100.0;
-                        state.text_matrix =
-                            multiply_matrix(&[1.0, 0.0, 0.0, 1.0, tx, 0.0], &state.text_matrix);
                     }
                 }
 
@@ -937,6 +966,33 @@ impl TextExtractor {
                                     // for Artifact scopes (issue #330).
                                     let skip_text =
                                         skip_artifact_text(&state, self.options.include_artifacts);
+
+                                    // Pen origin in user space = (CTM × text_matrix)(0, 0).
+                                    let (x, y) = text_origin(&state);
+
+                                    // Insert a newline when this TJ piece starts on a
+                                    // different visual line than the previously shown
+                                    // text (issue #381), or when the pen jumps far back
+                                    // to the left — a line wrap whose line height is
+                                    // below `newline_threshold` (issue #390). Only the
+                                    // newline case is handled here: horizontal word
+                                    // spacing within a line is governed by the
+                                    // `TextElement::Spacing` kern logic below, and a
+                                    // forward dx-based space would wrongly split a single
+                                    // word that a TJ array draws as several positioned
+                                    // pieces. A *backward* dx beyond one line-height
+                                    // (2× the threshold, conservative) is a wrap, not a
+                                    // kern, so it is safe to break there.
+                                    let line_wrap =
+                                        (x - last_x) < -(self.options.newline_threshold * 2.0);
+                                    if !skip_text
+                                        && !extracted_text.is_empty()
+                                        && ((y - last_y).abs() > self.options.newline_threshold
+                                            || line_wrap)
+                                    {
+                                        extracted_text.push('\n');
+                                    }
+
                                     if !skip_text {
                                         extracted_text.push_str(&decoded);
                                     }
@@ -954,8 +1010,8 @@ impl TextExtractor {
                                         )
                                     };
 
-                                    if self.options.preserve_layout {
-                                        let (x, y) = text_origin(&state);
+                                    if self.options.preserve_layout || self.options.reorder_columns
+                                    {
                                         emit_text_fragment(
                                             &mut fragments,
                                             &decoded,
@@ -967,11 +1023,12 @@ impl TextExtractor {
                                         );
                                     }
 
-                                    let tx = text_width * state.horizontal_scale / 100.0;
-                                    state.text_matrix = multiply_matrix(
-                                        &[1.0, 0.0, 0.0, 1.0, tx, 0.0],
-                                        &state.text_matrix,
-                                    );
+                                    // Keep the pen position in sync so a following
+                                    // `Tj`/`TJ` measures its gap from the right origin
+                                    // (issue #381: a stale `last_y` dropped newlines;
+                                    // issue #386: `last_x` must fold in Tz/CTM scale).
+                                    last_x = advance_pen(&mut state, text_width);
+                                    last_y = y;
                                 }
                                 TextElement::Spacing(adjustment) => {
                                     // Text position adjustment (negative = move left,
@@ -1000,7 +1057,8 @@ impl TextExtractor {
                                         // even though no real `Tj` has fired yet. The
                                         // EMC flush will supply the canonical fragment
                                         // text from the override (Phase 1 #269 contract).
-                                        if self.options.preserve_layout
+                                        if (self.options.preserve_layout
+                                            || self.options.reorder_columns)
                                             && state.pending_actualtext.is_none()
                                         {
                                             // Emit a synthetic single-space fragment at the
@@ -1067,7 +1125,7 @@ impl TextExtractor {
                             )
                         };
 
-                        if self.options.preserve_layout {
+                        if self.options.preserve_layout || self.options.reorder_columns {
                             emit_text_fragment(
                                 &mut fragments,
                                 &decoded,
@@ -1079,12 +1137,8 @@ impl TextExtractor {
                             );
                         }
 
-                        last_x = x + text_width;
+                        last_x = advance_pen(&mut state, text_width);
                         last_y = y;
-
-                        let tx = text_width * state.horizontal_scale / 100.0;
-                        state.text_matrix =
-                            multiply_matrix(&[1.0, 0.0, 0.0, 1.0, tx, 0.0], &state.text_matrix);
                     }
                 }
 
@@ -1128,7 +1182,7 @@ impl TextExtractor {
                             )
                         };
 
-                        if self.options.preserve_layout {
+                        if self.options.preserve_layout || self.options.reorder_columns {
                             emit_text_fragment(
                                 &mut fragments,
                                 &decoded,
@@ -1140,12 +1194,8 @@ impl TextExtractor {
                             );
                         }
 
-                        last_x = x + text_width;
+                        last_x = advance_pen(&mut state, text_width);
                         last_y = y;
-
-                        let tx = text_width * state.horizontal_scale / 100.0;
-                        state.text_matrix =
-                            multiply_matrix(&[1.0, 0.0, 0.0, 1.0, tx, 0.0], &state.text_matrix);
                     }
                 }
 
@@ -1285,7 +1335,9 @@ impl TextExtractor {
                         // If we just closed the scope that opened the pending run, flush it.
                         if pending.stack_depth + 1 == popped_depth {
                             let run = state.pending_actualtext.take().unwrap();
-                            if run.populated && self.options.preserve_layout {
+                            if run.populated
+                                && (self.options.preserve_layout || self.options.reorder_columns)
+                            {
                                 let (mcid, struct_tag) = innermost_mc_tag(&state.mc_stack);
                                 let in_artifact = state.mc_stack.iter().any(|e| e.is_artifact);
                                 if !in_artifact || self.options.include_artifacts {
@@ -1480,8 +1532,13 @@ impl TextExtractor {
             band_a.total_cmp(&band_b).then_with(|| a.x.total_cmp(&b.x))
         });
 
-        // Detect columns if requested
-        if self.options.detect_columns {
+        // Detect columns if requested. `reorder_columns` forces column detection
+        // only on the flat path (`!preserve_layout`); in layout mode `detect_columns`
+        // is the intended control, keeping the `reorder_columns` field flat-only as
+        // documented (issue #389).
+        if self.options.detect_columns
+            || (self.options.reorder_columns && !self.options.preserve_layout)
+        {
             self.detect_and_sort_columns(fragments);
         }
     }
@@ -1958,6 +2015,21 @@ fn emit_text_fragment(
 fn text_origin(state: &TextState) -> (f64, f64) {
     let combined = multiply_matrix(&state.text_matrix, &state.ctm);
     transform_point(0.0, 0.0, &combined)
+}
+
+/// Advance the text matrix by one shown glyph run of unscaled width
+/// `text_width` and return the pen's new x in user space.
+///
+/// The advance applied to the text matrix is `text_width * Tz/100`
+/// (`state.horizontal_scale`), and the resulting user-space displacement also
+/// folds in the CTM's x-scale. The caller's `last_x` (used for `dx`-based
+/// space decisions) must therefore come from the post-advance pen origin, not
+/// from `origin_x + text_width`, which ignores both factors and trails the
+/// real pen whenever `Tz != 100` or the CTM scales x (issue #386).
+fn advance_pen(state: &mut TextState, text_width: f64) -> f64 {
+    let tx = text_width * state.horizontal_scale / 100.0;
+    state.text_matrix = multiply_matrix(&[1.0, 0.0, 0.0, 1.0, tx, 0.0], &state.text_matrix);
+    text_origin(state).0
 }
 
 /// Multiply two transformation matrices
@@ -2438,6 +2510,7 @@ mod tests {
             track_space_decisions: false,
             reconstruct_paragraphs: false,
             include_artifacts: false,
+            reorder_columns: false,
         };
         assert!(options.preserve_layout);
         assert_eq!(options.space_threshold, 0.5);
@@ -2638,6 +2711,7 @@ mod tests {
             track_space_decisions: false,
             reconstruct_paragraphs: false,
             include_artifacts: false,
+            reorder_columns: false,
         };
         let extractor = TextExtractor::with_options(options.clone());
         assert_eq!(extractor.options.preserve_layout, options.preserve_layout);
