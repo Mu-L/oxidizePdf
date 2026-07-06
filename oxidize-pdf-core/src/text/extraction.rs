@@ -875,7 +875,14 @@ impl TextExtractor {
                             let dx = x - last_x;
                             let dy = (y - last_y).abs();
 
-                            if dy > self.options.newline_threshold {
+                            // A large backward jump in x is a line wrap: the pen
+                            // returns to the left margin on a new line. When the
+                            // line height is below `newline_threshold` the dy check
+                            // alone misses it, so treat a backward dx beyond one
+                            // line-height (2× the threshold, conservative) as a
+                            // newline regardless of dy (issue #390).
+                            let line_wrap = dx < -(self.options.newline_threshold * 2.0);
+                            if dy > self.options.newline_threshold || line_wrap {
                                 extracted_text.push('\n');
                             } else if dx > self.options.space_threshold * state.font_size {
                                 extracted_text.push(' ');
@@ -940,15 +947,23 @@ impl TextExtractor {
 
                                     // Insert a newline when this TJ piece starts on a
                                     // different visual line than the previously shown
-                                    // text (issue #381). Only the vertical case is
-                                    // handled here: horizontal word spacing within a
-                                    // line is governed by the `TextElement::Spacing`
-                                    // kern logic below, and adding a dx-based space
-                                    // would wrongly split a single word that a TJ array
-                                    // draws as several positioned pieces.
+                                    // text (issue #381), or when the pen jumps far back
+                                    // to the left — a line wrap whose line height is
+                                    // below `newline_threshold` (issue #390). Only the
+                                    // newline case is handled here: horizontal word
+                                    // spacing within a line is governed by the
+                                    // `TextElement::Spacing` kern logic below, and a
+                                    // forward dx-based space would wrongly split a single
+                                    // word that a TJ array draws as several positioned
+                                    // pieces. A *backward* dx beyond one line-height
+                                    // (2× the threshold, conservative) is a wrap, not a
+                                    // kern, so it is safe to break there.
+                                    let line_wrap =
+                                        (x - last_x) < -(self.options.newline_threshold * 2.0);
                                     if !skip_text
                                         && !extracted_text.is_empty()
-                                        && (y - last_y).abs() > self.options.newline_threshold
+                                        && ((y - last_y).abs() > self.options.newline_threshold
+                                            || line_wrap)
                                     {
                                         extracted_text.push('\n');
                                     }
