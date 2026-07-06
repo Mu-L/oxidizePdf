@@ -125,3 +125,72 @@ fn rag_chunks_with_counter_word_proxy_parity() {
         assert_eq!(b.token_estimate, i.token_estimate);
     }
 }
+
+#[cfg(feature = "tiktoken")]
+mod tiktoken_integration {
+    use super::para;
+    use oxidize_pdf::pipeline::{
+        HybridChunkConfig, HybridChunker, TiktokenCounter, TokenCounter, WordProxyCounter,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn injected_tiktoken_stamps_exact_wholetext_count() {
+        // Single paragraph, subword-heavy. Stamp must equal cl100k count of the
+        // whole chunk text, not the word count.
+        let text = "https://example.com/verify?token=abc123";
+        let elements = vec![para(text)];
+        let chunker = HybridChunker::new(HybridChunkConfig {
+            max_tokens: 10_000, // large: keep it a single chunk
+            ..Default::default()
+        })
+        .with_token_counter(Arc::new(TiktokenCounter::cl100k_base()));
+        let chunks = chunker.chunk(&elements);
+        assert_eq!(chunks.len(), 1);
+
+        let expected = TiktokenCounter::cl100k_base().count(text);
+        assert_eq!(chunks[0].token_estimate(), expected);
+        // And it must differ from the word-proxy (1 word, no whitespace).
+        assert_eq!(WordProxyCounter.count(text), 1);
+        assert!(expected > 1);
+    }
+
+    #[test]
+    fn tiktoken_drives_split_word_proxy_would_not() {
+        // Two subword-heavy paragraphs. Under word-proxy each is 1 "word" → they
+        // stay merged under a tiny budget. Under cl100k each is many tokens → the
+        // summed decision exceeds the budget and they do NOT merge.
+        let a = "https://example.com/alpha/one/two/three";
+        let b = "https://example.com/beta/four/five/six";
+
+        // Precondition guard: the split test only proves what it claims if each
+        // URL individually exceeds max_tokens (5) under cl100k. Confirmed
+        // empirically: cl100k_base().count(a) == 12, count(b) == 12.
+        let count_a = TiktokenCounter::cl100k_base().count(a);
+        let count_b = TiktokenCounter::cl100k_base().count(b);
+        assert!(count_a > 5, "a should exceed max_tokens=5, got {}", count_a);
+        assert!(count_b > 5, "b should exceed max_tokens=5, got {}", count_b);
+
+        let elements = vec![para(a), para(b)];
+        let cfg = HybridChunkConfig {
+            max_tokens: 5,
+            ..Default::default()
+        };
+
+        // Word-proxy: elem_tokens(a)=1, elem_tokens(b)=1, 1+1<=5 → may merge into 1 chunk.
+        let wp_chunks = HybridChunker::new(cfg.clone()).chunk(&elements);
+
+        // Tiktoken: each URL is >5 cl100k tokens → cannot merge; also each single
+        // element exceeds max_tokens → splittable path fires.
+        let tk_chunks = HybridChunker::new(cfg)
+            .with_token_counter(Arc::new(TiktokenCounter::cl100k_base()))
+            .chunk(&elements);
+
+        assert!(
+            tk_chunks.len() > wp_chunks.len(),
+            "tiktoken should produce more chunks: wp={} tk={}",
+            wp_chunks.len(),
+            tk_chunks.len()
+        );
+    }
+}
