@@ -1057,7 +1057,8 @@ impl TextExtractor {
                                         // even though no real `Tj` has fired yet. The
                                         // EMC flush will supply the canonical fragment
                                         // text from the override (Phase 1 #269 contract).
-                                        if self.options.preserve_layout
+                                        if (self.options.preserve_layout
+                                            || self.options.reorder_columns)
                                             && state.pending_actualtext.is_none()
                                         {
                                             // Emit a synthetic single-space fragment at the
@@ -1531,8 +1532,13 @@ impl TextExtractor {
             band_a.total_cmp(&band_b).then_with(|| a.x.total_cmp(&b.x))
         });
 
-        // Detect columns if requested
-        if self.options.detect_columns || self.options.reorder_columns {
+        // Detect columns if requested. `reorder_columns` forces column detection
+        // only on the flat path (`!preserve_layout`); in layout mode `detect_columns`
+        // is the intended control, keeping the `reorder_columns` field flat-only as
+        // documented (issue #389).
+        if self.options.detect_columns
+            || (self.options.reorder_columns && !self.options.preserve_layout)
+        {
             self.detect_and_sort_columns(fragments);
         }
     }

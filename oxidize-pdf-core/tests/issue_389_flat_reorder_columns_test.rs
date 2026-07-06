@@ -78,3 +78,27 @@ fn reorder_columns_keeps_column_tokens_adjacent() {
         "col2 email must be intact under reorder_columns: {text:?}"
     );
 }
+
+#[test]
+fn reorder_columns_preserves_wide_tj_kern_space() {
+    // A word break encoded purely as a wide TJ kern (issue #272), with the kern
+    // in the [tj_space_threshold, space_threshold) * font_size band: -250/1000 *
+    // 10pt = 2.5pt, which is > 2.0pt (tj_space_threshold*fs, so the synthetic
+    // space fires) but < 3.0pt (space_threshold*fs, so `reconstruct_text_from_
+    // fragments` would NOT insert a gap-based space). The synthetic-space
+    // fragment must therefore be collected under reorder_columns too, or the two
+    // words concatenate. Single column → no reordering; this isolates the kern.
+    const KERN_BREAK: &str = concat!(
+        "BT\n/F1 10 Tf\n",
+        "1 0 0 1 50 700 Tm\n[(alpha) -250 (beta)] TJ\nET"
+    );
+    let opts = ExtractionOptions {
+        reorder_columns: true,
+        ..Default::default()
+    };
+    let text = extract(KERN_BREAK, opts).text;
+    assert!(
+        text.contains("alpha beta"),
+        "wide TJ kern must stay a space under reorder_columns, not concatenate: {text:?}"
+    );
+}
