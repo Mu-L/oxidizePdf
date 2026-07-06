@@ -30,3 +30,23 @@ fn with_token_counter_accepts_word_proxy_explicitly() {
     let chunks = chunker.chunk(&elements);
     assert_eq!(chunks[0].token_estimate(), 3);
 }
+
+#[test]
+fn default_semantic_chunker_stamps_word_count() {
+    use oxidize_pdf::pipeline::{SemanticChunkConfig, SemanticChunker};
+    let elements = vec![para("one two three four five")];
+    let chunker = SemanticChunker::new(SemanticChunkConfig::default());
+    let chunks = chunker.chunk(&elements);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].token_estimate(), 5);
+}
+
+#[test]
+fn semantic_with_token_counter_builder_exists() {
+    use oxidize_pdf::pipeline::{SemanticChunkConfig, SemanticChunker, WordProxyCounter};
+    let elements = vec![para("one two three")];
+    let chunker = SemanticChunker::new(SemanticChunkConfig::default())
+        .with_token_counter(Arc::new(WordProxyCounter));
+    let chunks = chunker.chunk(&elements);
+    assert_eq!(chunks[0].token_estimate(), 3);
+}
