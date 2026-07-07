@@ -60,6 +60,34 @@ endobj
     }
 }
 
+/// Regression for the negative-`/Length` capacity-overflow: a present-but-
+/// negative `/Length` must not abort with a giant allocation. In lenient mode
+/// (the default) the parser falls back to the bounded endstream search and
+/// recovers the actual stream bytes verbatim.
+#[test]
+fn test_stream_negative_length_recovers_data_lenient() {
+    let content =
+        "1 0 obj\n<</Length -100>>\nstream\nThis is some stream data\nendstream\nendobj\n";
+    let pdf = create_pdf_with_content(content);
+    let cursor = Cursor::new(pdf);
+
+    let doc = PdfReader::new(cursor)
+        .map(PdfDocument::new)
+        .expect("lenient parse of a negative-length stream must not fail at load");
+    let obj = doc
+        .get_object(1, 0)
+        .expect("object 1 must be retrievable without panicking");
+
+    let stream = obj
+        .as_stream()
+        .expect("object 1 must parse as a stream despite the invalid /Length");
+    let recovered = String::from_utf8_lossy(&stream.data);
+    assert!(
+        recovered.contains("This is some stream data"),
+        "endstream-search fallback must recover the real stream bytes; got {recovered:?}"
+    );
+}
+
 /// Test 2: Stream with length larger than file size
 #[test]
 fn test_stream_excessive_length() {

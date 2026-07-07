@@ -559,6 +559,27 @@ impl PdfObject {
                 if *len == -1 {
                     // Special marker for missing length - we need to search for endstream
                     usize::MAX // We'll handle this specially below
+                } else if *len < 0 {
+                    // A present-but-negative /Length is invalid (ISO 32000-1
+                    // §7.3.8.2: Length is a non-negative integer). Casting it to
+                    // usize would request an astronomically large buffer and
+                    // abort the process with a capacity overflow. Fall back to
+                    // the bounded endstream search in lenient mode; fail cleanly
+                    // otherwise. (Regression guard: exposed once xref recovery
+                    // began reaching such streams by default — see #374.)
+                    if options.lenient_streams {
+                        if options.collect_warnings {
+                            tracing::debug!(
+                                "Warning: negative stream /Length {len}; searching for endstream marker"
+                            );
+                        }
+                        usize::MAX
+                    } else {
+                        return Err(ParseError::SyntaxError {
+                            position: lexer.position(),
+                            message: format!("Invalid negative stream length: {len}"),
+                        });
+                    }
                 } else {
                     *len as usize
                 }
