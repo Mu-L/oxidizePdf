@@ -151,6 +151,13 @@ pub struct Page {
     /// Populated by `Page::a4_with_metrics` and friends, or injected by
     /// `Document::add_page()` in Task 11.
     pub(crate) font_metrics_store: Option<FontMetricsStore>,
+    /// Collision-only rename map for preserved fonts (issue #395), stamped by
+    /// the writer just before content generation. Maps an original preserved
+    /// `/Font` key to its disambiguated key when (and only when) that key
+    /// collided with a writer-injected/overlay font. Empty for pages with no
+    /// preserved fonts or no collisions — in which case the preserved content
+    /// is emitted verbatim.
+    pub(crate) preserved_font_rewrite_map: HashMap<String, String>,
 }
 
 impl Page {
@@ -180,6 +187,7 @@ impl Page {
             preserved_resources: None,
             page_ops: Vec::new(),
             font_metrics_store: None,
+            preserved_font_rewrite_map: HashMap::new(),
         }
     }
 
@@ -1624,34 +1632,17 @@ impl Page {
         let text_tail = self.text_context.generate_operations()?;
         final_content.extend_from_slice(&text_tail);
 
-        // Add any content that was added via add_text_flow
-        // Phase 2.3: Rewrite font references in preserved content if fonts were renamed
-        let content_to_add = if let Some(ref preserved_res) = self.preserved_resources {
-            // Check if we have preserved fonts that need renaming
-            if let Some(fonts_dict) = preserved_res.get("Font") {
-                if let crate::pdf_objects::Object::Dictionary(ref fonts) = fonts_dict {
-                    // Build font mapping (F1 → OrigF1, Arial → OrigArial, etc.)
-                    let mut font_mapping = std::collections::HashMap::new();
-                    for (original_name, _) in fonts.iter() {
-                        let new_name = format!("Orig{}", original_name.as_str());
-                        font_mapping.insert(original_name.as_str().to_string(), new_name);
-                    }
-
-                    // Rewrite font references in preserved content
-                    if !font_mapping.is_empty() && !self.content.is_empty() {
-                        use crate::writer::rewrite_font_references;
-                        rewrite_font_references(&self.content, &font_mapping)
-                    } else {
-                        self.content.clone()
-                    }
-                } else {
-                    self.content.clone()
-                }
-            } else {
-                self.content.clone()
-            }
-        } else {
+        // Add preserved original content. Issue #395: rewrite only the font
+        // references the writer disambiguated (collision-only). When no font
+        // collided, `preserved_font_rewrite_map` is empty and the preserved
+        // content is emitted verbatim — the common case (incl. all-non-base-14
+        // inputs like `testi.pdf`), which avoids ever touching the stream.
+        let content_to_add = if self.preserved_font_rewrite_map.is_empty()
+            || self.content.is_empty()
+        {
             self.content.clone()
+        } else {
+            crate::writer::rewrite_font_references(&self.content, &self.preserved_font_rewrite_map)
         };
 
         final_content.extend_from_slice(&content_to_add);
