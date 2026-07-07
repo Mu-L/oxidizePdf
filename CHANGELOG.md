@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+## [3.1.1] - 2026-07-07
+
+### Fixed
+
+- **AES-256 owner-password (R5/R6) hashing** is now spec-compliant and
+  interoperable with conforming readers: the R6 sites no longer double-include
+  the `password‖salt‖U` blob, and the R5 sites include the 48-byte `/U` entry
+  as Adobe extension level 3 requires. Owner-password unlock and writer
+  round-trips now match qpdf/Adobe. (#380)
+- **Missing or corrupt cross-reference tables** are now reconstructed by default
+  via the object-header scan (poppler/pdf.js/qpdf-style robustness), so PDFs
+  that previously failed with `Invalid xref table` open. The recovery path
+  preserves `/Encrypt` and `/ID`, so an encrypted document whose xref must be
+  rebuilt can never open as plaintext; `ParseOptions::strict()` still fails
+  loudly. (#374)
+- **Preserved embedded fonts** whose `/Font` resource key collides with a
+  writer-injected base-14 font (e.g. `/Helvetica`) are no longer silently
+  dropped. Disambiguation is now collision-only, and the preserved content
+  stream is rewritten with a structure-preserving tokenizer that handles
+  operators split across lines and never touches a name inside a string or
+  comment literal. (#395)
+- **Negative stream `/Length`** no longer aborts the process with a
+  capacity-overflow panic (a denial-of-service surface). Invalid negative
+  lengths fall back to a bounded `endstream` search in lenient mode and a clean
+  error in strict mode. (#401)
+
 ## [3.1.0] - 2026-07-06
 
 ### Added

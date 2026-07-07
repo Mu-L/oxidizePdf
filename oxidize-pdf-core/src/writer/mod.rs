@@ -8,7 +8,9 @@ mod signature;
 mod xref_stream_writer;
 
 // Phase 2 utilities for font preservation
-pub(crate) use content_stream_utils::{rename_preserved_fonts, rewrite_font_references};
+pub(crate) use content_stream_utils::{
+    apply_font_rename_map, collision_font_mapping, rewrite_font_references, INJECTED_BASE_FONT_KEYS,
+};
 pub use incremental_form_fill::IncrementalFormFiller;
 pub use object_streams::{ObjectStream, ObjectStreamConfig, ObjectStreamStats, ObjectStreamWriter};
 pub use pdf_writer::{PdfWriter, WriterConfig};

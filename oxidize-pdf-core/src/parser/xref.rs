@@ -470,7 +470,16 @@ impl XRefTable {
         match Self::parse_with_incremental_updates_options(reader, options) {
             Ok(table) => Ok(table),
             Err(e) => {
-                if options.lenient_syntax {
+                // Reconstructing a missing/corrupt cross-reference table by
+                // scanning object headers is standard robustness behaviour for
+                // a PDF reader (poppler/pdf.js/qpdf all do it), NOT a syntax
+                // tolerance. Issue #374: files without a `startxref`/`xref`
+                // (e.g. poppler fuzzing fixtures) must still be recoverable via
+                // `PdfReader::new`. Gate recovery on `max_recovery_attempts > 0`
+                // — the semantic "recovery allowed" knob — so `default()`
+                // (attempts = 3) and `tolerant()` (attempts = 5) reconstruct,
+                // while `strict()` (attempts = 0) keeps failing loudly.
+                if options.max_recovery_attempts > 0 {
                     tracing::warn!("Primary XRef parsing failed: {e:?}, attempting recovery");
 
                     // Reset reader position and try recovery
@@ -1054,7 +1063,7 @@ impl XRefTable {
     /// Parse XRef table using recovery mode with options
     fn parse_with_recovery_options<R: Read + Seek>(
         reader: &mut BufReader<R>,
-        _options: &super::ParseOptions,
+        options: &super::ParseOptions,
     ) -> ParseResult<Self> {
         // Bounded-memory recovery (Issue #339): scan object headers in fixed-size
         // chunks and resolve the catalog through per-object / file-tail windows,
@@ -1097,6 +1106,19 @@ impl XRefTable {
             "Size".to_string(),
             super::objects::PdfObject::Integer(table.len() as i64),
         );
+
+        // 3b) Preserve `/Encrypt` and `/ID` from the original classic trailer so
+        //     a reconstructed ENCRYPTED document is not silently opened as
+        //     plaintext (Issue #374 fail-safe). Dropping `/Encrypt` here would
+        //     make `EncryptionHandler::detect_encryption` return false and the
+        //     reader would treat ciphertext as cleartext.
+        let (encrypt, id) = extract_encrypt_and_id_from_trailer(&root_tail, options);
+        if let Some(encrypt) = encrypt {
+            trailer.insert("Encrypt".to_string(), encrypt);
+        }
+        if let Some(id) = id {
+            trailer.insert("ID".to_string(), id);
+        }
 
         // 4) Resolve the catalog object.
         let mut catalog_candidate = None;
@@ -2483,17 +2505,25 @@ mod tests {
 
     #[test]
     fn test_xref_parse_with_fallback() {
-        // Test that fallback works when primary parsing fails
+        // Issue #374: a PDF with no xref structure at all is reconstructed by
+        // scanning object headers when recovery is allowed
+        // (max_recovery_attempts > 0, the case for default options).
         let pdf_content =
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n";
-        let mut reader = BufReader::new(Cursor::new(pdf_content));
 
-        // PDF without any xref structure cannot be parsed by XRefTable::parse
-        // This would need a higher-level recovery mechanism
-        let result = XRefTable::parse(&mut reader);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(matches!(e, ParseError::InvalidXRef));
+        // Default options allow recovery: the table is rebuilt from the scan.
+        let mut reader = BufReader::new(Cursor::new(pdf_content.to_vec()));
+        let table = XRefTable::parse(&mut reader).expect("recovery rebuilds xref from object scan");
+        assert!(table.get_entry(1).is_some(), "object 1 indexed by scan");
+        assert!(table.get_entry(2).is_some(), "object 2 indexed by scan");
+
+        // strict() disables recovery (max_recovery_attempts == 0): a missing
+        // xref must still fail loudly with InvalidXRef.
+        let mut reader = BufReader::new(Cursor::new(pdf_content.to_vec()));
+        match XRefTable::parse_with_options(&mut reader, &ParseOptions::strict()) {
+            Err(ParseError::InvalidXRef) => {}
+            Ok(_) => panic!("strict() must fail on missing xref, not recover"),
+            Err(other) => panic!("strict() must fail with InvalidXRef, got: {other:?}"),
         }
     }
 
@@ -3174,6 +3204,96 @@ startxref\n\
         let result = XRefTable::parse(&mut reader);
         // Should handle incomplete subsection
         assert!(result.is_err() || result.is_ok());
+    }
+}
+
+type EncryptAndId = (
+    Option<super::objects::PdfObject>,
+    Option<super::objects::PdfObject>,
+);
+
+/// Extract `/Encrypt` and `/ID` from the original trailer found in a bounded
+/// file tail (Issue #374), covering BOTH classic trailers and cross-reference
+/// streams.
+///
+/// XRef reconstruction builds a synthetic trailer; without carrying the
+/// original `/Encrypt` forward, an encrypted document whose xref had to be
+/// rebuilt would be treated as unencrypted (fail-open). `/ID` is preserved too
+/// because the standard security handler mixes it into the encryption key.
+///
+/// Both branches parse with the real object parser (binary-safe: handles
+/// hex/literal strings, arrays, refs) and honour the caller's `ParseOptions`
+/// so lenient tokenizing (e.g. a stray byte before `<<`) is applied when the
+/// caller asked for it — not silently reverted to strict.
+///
+/// 1. Classic `trailer` keyword (PDF ≤1.4 and hybrid files).
+/// 2. Cross-reference stream (PDF 1.5+): `/Encrypt` lives in the xref-stream
+///    object's own dict, which is uncompressed text even when the stream data
+///    is filtered, so it can be parsed straight from the tail.
+fn extract_encrypt_and_id_from_trailer(tail: &[u8], options: &ParseOptions) -> EncryptAndId {
+    // 1) Classic trailer.
+    if let Some(pos) = rfind_byte_pattern(tail, b"trailer") {
+        let after = &tail[pos + b"trailer".len()..];
+        let mut lexer =
+            super::lexer::Lexer::new_with_options(std::io::Cursor::new(after), options.clone());
+        if let Ok(super::objects::PdfObject::Dictionary(dict)) =
+            super::objects::PdfObject::parse_with_options(&mut lexer, options)
+        {
+            let encrypt = dict.get("Encrypt").cloned();
+            let id = dict.get("ID").cloned();
+            if encrypt.is_some() || id.is_some() {
+                return (encrypt, id);
+            }
+        }
+    }
+
+    // 2) Cross-reference stream dict.
+    extract_encrypt_and_id_from_xref_stream(tail, options)
+}
+
+/// Extract `/Encrypt` and `/ID` from a cross-reference stream object's dict in
+/// the tail (Issue #374, fail-safe for PDF 1.5+ encrypted files).
+///
+/// Anchors on the xref stream object header (`N G obj`) that precedes
+/// `/Type /XRef`, then parses the dictionary that opens after it — truncating
+/// the region at the `stream` keyword so the parser sees a plain dictionary
+/// (never attempting to consume the filtered stream body).
+fn extract_encrypt_and_id_from_xref_stream(tail: &[u8], options: &ParseOptions) -> EncryptAndId {
+    let type_pos = match rfind_byte_pattern(tail, b"/Type/XRef")
+        .or_else(|| rfind_byte_pattern(tail, b"/Type /XRef"))
+    {
+        Some(p) => p,
+        None => return (None, None),
+    };
+
+    // Anchor on the object header so a nested `<<` before `/Type` can't be
+    // mistaken for the dict opening.
+    let Some(obj_pos) = rfind_byte_pattern(&tail[..type_pos], b"obj") else {
+        return (None, None);
+    };
+    let Some(rel) = find_byte_pattern(&tail[obj_pos..type_pos], b"<<") else {
+        return (None, None);
+    };
+    let dict_start = obj_pos + rel;
+
+    // Parse ONLY the inner dictionary (up to `>>`). We must not let the object
+    // parser attempt the following `stream` body: its /Length may be an
+    // indirect reference or otherwise unparseable in a recovery scenario, and a
+    // body-parse failure would discard the dictionary (and thus /Encrypt) —
+    // reopening the fail-open hole. Truncating at a raw `stream` substring is
+    // also wrong, since a value before /Encrypt (e.g. `/Producer (streamlined)`)
+    // can contain those bytes. The inner-dict parser respects string/nesting
+    // boundaries, so neither problem applies.
+    let region = &tail[dict_start..];
+    let mut lexer =
+        super::lexer::Lexer::new_with_options(std::io::Cursor::new(region), options.clone());
+    // Consume the opening `<<` before parsing the dictionary body.
+    if !matches!(lexer.next_token(), Ok(super::lexer::Token::DictStart)) {
+        return (None, None);
+    }
+    match super::objects::PdfObject::parse_dictionary_inner_with_options(&mut lexer, options) {
+        Ok(dict) => (dict.get("Encrypt").cloned(), dict.get("ID").cloned()),
+        Err(_) => (None, None),
     }
 }
 

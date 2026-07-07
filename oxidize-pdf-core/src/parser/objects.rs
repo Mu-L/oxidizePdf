@@ -496,8 +496,14 @@ impl PdfObject {
         }
     }
 
-    /// Parse the inner dictionary with custom options
-    fn parse_dictionary_inner_with_options<R: Read + std::io::Seek>(
+    /// Parse the inner dictionary with custom options.
+    ///
+    /// Assumes the opening `<<` token has already been consumed and parses key/
+    /// value pairs up to the closing `>>`, WITHOUT attempting to read any
+    /// following `stream` body. `pub(crate)` so xref recovery (Issue #374) can
+    /// extract `/Encrypt`/`/ID` from a cross-reference stream object's dict
+    /// without risking a stream-body parse failure discarding the dictionary.
+    pub(crate) fn parse_dictionary_inner_with_options<R: Read + std::io::Seek>(
         lexer: &mut Lexer<R>,
         options: &super::ParseOptions,
     ) -> ParseResult<PdfDictionary> {
@@ -553,6 +559,27 @@ impl PdfObject {
                 if *len == -1 {
                     // Special marker for missing length - we need to search for endstream
                     usize::MAX // We'll handle this specially below
+                } else if *len < 0 {
+                    // A present-but-negative /Length is invalid (ISO 32000-1
+                    // §7.3.8.2: Length is a non-negative integer). Casting it to
+                    // usize would request an astronomically large buffer and
+                    // abort the process with a capacity overflow. Fall back to
+                    // the bounded endstream search in lenient mode; fail cleanly
+                    // otherwise. (Regression guard: exposed once xref recovery
+                    // began reaching such streams by default — see #374.)
+                    if options.lenient_streams {
+                        if options.collect_warnings {
+                            tracing::debug!(
+                                "Warning: negative stream /Length {len}; searching for endstream marker"
+                            );
+                        }
+                        usize::MAX
+                    } else {
+                        return Err(ParseError::SyntaxError {
+                            position: lexer.position(),
+                            message: format!("Invalid negative stream length: {len}"),
+                        });
+                    }
                 } else {
                     *len as usize
                 }

@@ -3747,11 +3747,22 @@ startxref
 %%EOF"
             .to_vec();
 
+        // Issue #374: a corrupt xref table is reconstructed by scanning object
+        // headers (default options allow recovery). The scan finds object 1 and
+        // resolves the catalog.
+        let cursor = Cursor::new(corrupt_pdf.clone());
+        let mut reader = PdfReader::new(cursor).expect("corrupt xref is reconstructed by scan");
+        let catalog = reader
+            .catalog()
+            .expect("catalog resolves after reconstruction");
+        assert_eq!(
+            catalog.get("Type"),
+            Some(&PdfObject::Name(PdfName("Catalog".to_string()))),
+        );
+
+        // strict() disables recovery: the corrupt xref must still fail loudly.
         let cursor = Cursor::new(corrupt_pdf);
-        let result = PdfReader::new(cursor);
-        // Even with lenient parsing, completely corrupted xref table cannot be recovered
-        // Note: XRef recovery for corrupted tables is a potential future enhancement
-        assert!(result.is_err());
+        assert!(PdfReader::new_with_options(cursor, ParseOptions::strict()).is_err());
     }
 
     #[test]
@@ -3769,11 +3780,22 @@ startxref
 %%EOF"
             .to_vec();
 
+        // Issue #374: without a trailer, recovery locates the catalog by
+        // scanning objects for /Type /Catalog and synthesizes the trailer's
+        // /Root, so default parsing succeeds.
+        let cursor = Cursor::new(pdf_no_trailer.clone());
+        let mut reader = PdfReader::new(cursor).expect("missing trailer recovered by object scan");
+        let catalog = reader
+            .catalog()
+            .expect("catalog resolved from scanned /Root");
+        assert_eq!(
+            catalog.get("Type"),
+            Some(&PdfObject::Name(PdfName("Catalog".to_string()))),
+        );
+
+        // strict() disables recovery: a missing trailer must still fail.
         let cursor = Cursor::new(pdf_no_trailer);
-        let result = PdfReader::new(cursor);
-        // PDFs without trailer cannot be parsed even with lenient mode
-        // The trailer is essential for locating the catalog
-        assert!(result.is_err());
+        assert!(PdfReader::new_with_options(cursor, ParseOptions::strict()).is_err());
     }
 
     #[test]
@@ -3940,11 +3962,22 @@ startxref
 %%EOF"
             .to_vec();
 
+        // Issue #374: a trailer without /Root triggers recovery, which locates
+        // the catalog by content scan and synthesizes /Root, so default parsing
+        // succeeds and resolves the catalog.
+        let cursor = Cursor::new(bad_pdf.clone());
+        let mut reader = PdfReader::new(cursor).expect("missing /Root recovered by object scan");
+        let catalog = reader
+            .catalog()
+            .expect("catalog resolved from scanned /Root");
+        assert_eq!(
+            catalog.get("Type"),
+            Some(&PdfObject::Name(PdfName("Catalog".to_string()))),
+        );
+
+        // strict() disables recovery: a trailer without /Root must still fail.
         let cursor = Cursor::new(bad_pdf);
-        let result = PdfReader::new(cursor);
-        // Trailer missing required /Root entry cannot be recovered
-        // This is a fundamental requirement for PDF structure
-        assert!(result.is_err());
+        assert!(PdfReader::new_with_options(cursor, ParseOptions::strict()).is_err());
     }
 
     #[test]
@@ -4000,14 +4033,23 @@ startxref
         // The PDF is malformed (incomplete xref), so even basic parsing fails
         assert!(strict_reader.is_err());
 
-        // Test lenient mode - even lenient mode cannot parse PDFs with incomplete xref
+        // Issue #374: default options allow recovery, so a PDF with a mismatched
+        // xref (caused here by the incorrect stream /Length) is reconstructed by
+        // scanning objects, and the catalog resolves.
         let cursor = Cursor::new(pdf_data);
         let mut options = ParseOptions::default();
         options.lenient_streams = true;
         options.max_recovery_bytes = 1000;
         options.collect_warnings = false;
-        let lenient_reader = PdfReader::new_with_options(cursor, options);
-        assert!(lenient_reader.is_err());
+        let mut reader =
+            PdfReader::new_with_options(cursor, options).expect("mismatched xref reconstructed");
+        let catalog = reader
+            .catalog()
+            .expect("catalog resolves after reconstruction");
+        assert_eq!(
+            catalog.get("Type"),
+            Some(&PdfObject::Name(PdfName("Catalog".to_string()))),
+        );
     }
 
     #[test]
@@ -4086,12 +4128,22 @@ startxref
         assert!(!reader.is_encrypted());
         assert!(reader.is_unlocked()); // Unencrypted PDFs are always "unlocked"
 
-        // Test encrypted PDF - this will fail during construction due to encryption
+        // Test encrypted PDF. Its xref offsets don't match, so it goes through
+        // reconstruction (Issue #374). The recovery must preserve /Encrypt so
+        // the document opens as ENCRYPTED and LOCKED (fail-safe), never silently
+        // as plaintext. It is not unlockable with the empty password here
+        // because /O and /U are placeholders.
         let encrypted_pdf = create_pdf_with_encryption();
         let cursor = Cursor::new(encrypted_pdf);
-        let result = PdfReader::new(cursor);
-        // Should fail because we don't support reading encrypted PDFs yet in construction
-        assert!(result.is_err());
+        let reader = PdfReader::new(cursor).expect("encrypted PDF opens as locked, not rejected");
+        assert!(
+            reader.is_encrypted(),
+            "must report encrypted, not plaintext"
+        );
+        assert!(
+            !reader.is_unlocked(),
+            "must stay locked without a valid password"
+        );
     }
 
     #[test]
@@ -4169,21 +4221,23 @@ startxref
 
     #[test]
     fn test_reader_encryption_error_handling() {
-        // This test verifies that encrypted PDFs are properly rejected during construction
+        // Fail-safe (Issue #374): an encrypted PDF whose xref must be rebuilt
+        // must never be opened as plaintext. Two outcomes are safe: rejected
+        // during construction, or opened while still reporting encrypted+locked.
+        // Opening it as an unlocked/unencrypted document is a fail-open bug.
         let encrypted_pdf = create_pdf_with_encryption();
         let cursor = Cursor::new(encrypted_pdf);
 
-        // Should fail during construction due to unsupported encryption
-        let result = PdfReader::new(cursor);
-        match result {
-            Err(ParseError::EncryptionNotSupported) => {
-                // Expected - encryption detected but not supported in current flow
-            }
-            Err(_) => {
-                // Other errors are also acceptable as encryption detection may fail parsing
-            }
-            Ok(_) => {
-                panic!("Should not successfully create reader for encrypted PDF without password");
+        match PdfReader::new(cursor) {
+            // Rejecting the encrypted document is safe.
+            Err(_) => {}
+            // Opening it is only safe if encryption is still recognized and the
+            // document remains locked (no valid password was supplied).
+            Ok(reader) => {
+                assert!(
+                    reader.is_encrypted() && !reader.is_unlocked(),
+                    "recovered encrypted PDF must stay encrypted+locked, not open as plaintext"
+                );
             }
         }
     }
