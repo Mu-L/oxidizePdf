@@ -1073,8 +1073,49 @@ impl<W: Write> PdfWriter<W> {
         Ok(())
     }
 
-    fn write_page_content(&mut self, content_id: ObjectId, page: &crate::page::Page) -> Result<()> {
+    /// Issue #395: build the collision-only rename map for a page's preserved
+    /// fonts. A preserved `/Font` key is disambiguated only when it collides
+    /// with a key already present in the page `/Font` dict the writer builds —
+    /// i.e. one of the unconditionally injected base fonts
+    /// ([`INJECTED_BASE_FONT_KEYS`]) or an overlay/custom font (`font_refs`).
+    /// Returns an empty map when the page has no preserved fonts or none
+    /// collide, so no content rewrite happens in the common case.
+    fn preserved_font_disambiguation_map(
+        page: &crate::page::Page,
+        font_refs: &HashMap<String, ObjectId>,
+    ) -> HashMap<String, String> {
+        let preserved_fonts = match page
+            .get_preserved_resources()
+            .and_then(|res| res.get("Font"))
+        {
+            Some(crate::pdf_objects::Object::Dictionary(fonts)) => fonts,
+            _ => return HashMap::new(),
+        };
+
+        let mut reserved: std::collections::HashSet<String> =
+            crate::writer::INJECTED_BASE_FONT_KEYS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        reserved.extend(font_refs.keys().cloned());
+
+        let preserved_keys: Vec<String> = preserved_fonts
+            .keys()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        crate::writer::collision_font_mapping(preserved_keys.iter().map(|s| s.as_str()), &reserved)
+    }
+
+    fn write_page_content(
+        &mut self,
+        content_id: ObjectId,
+        page: &crate::page::Page,
+        preserved_font_map: &HashMap<String, String>,
+    ) -> Result<()> {
         let mut page_copy = page.clone();
+        // Issue #395: drive the preserved-content font rewrite from the same
+        // collision-only map used for the resource-dict rename.
+        page_copy.preserved_font_rewrite_map = preserved_font_map.clone();
         let content = page_copy.generate_content()?;
 
         // Create stream with compression if enabled
@@ -2505,8 +2546,21 @@ impl<W: Write> PdfWriter<W> {
             let page_id = page_ids[i];
             let content_id = content_ids[i];
 
-            self.write_page_with_fonts(page_id, pages_id, content_id, page, document, font_refs)?;
-            self.write_page_content(content_id, page)?;
+            // Issue #395: compute the collision-only preserved-font rename map
+            // once and drive BOTH the resource-dict rename (write_page_with_fonts)
+            // and the content-stream rewrite (write_page_content) from it, so the
+            // two stay consistent by construction.
+            let preserved_font_map = Self::preserved_font_disambiguation_map(page, font_refs);
+            self.write_page_with_fonts(
+                page_id,
+                pages_id,
+                content_id,
+                page,
+                document,
+                font_refs,
+                &preserved_font_map,
+            )?;
+            self.write_page_content(content_id, page, &preserved_font_map)?;
         }
 
         Ok(())
@@ -2530,6 +2584,7 @@ impl<W: Write> PdfWriter<W> {
         page: &crate::page::Page,
         _document: &Document,
         font_refs: &HashMap<String, ObjectId>,
+        preserved_font_map: &HashMap<String, String>,
     ) -> Result<()> {
         // Start with the page's dictionary which includes annotations
         let mut page_dict = page.to_dict();
@@ -2913,12 +2968,12 @@ impl<W: Write> PdfWriter<W> {
             // Convert pdf_objects::Dictionary to writer Dictionary FIRST
             let mut preserved_writer_dict = self.convert_pdf_objects_dict_to_writer(preserved_res);
 
-            // Step 1: Rename preserved fonts (F1 → OrigF1)
+            // Step 1: Issue #395 — collision-only rename. Only preserved font
+            // keys that collide with an injected/overlay key are renamed (per
+            // `preserved_font_map`); every other key is kept, so non-colliding
+            // fonts are never disturbed and their content is never rewritten.
             if let Some(Object::Dictionary(fonts)) = preserved_writer_dict.get("Font") {
-                // Rename font dictionary keys using our utility function
-                let renamed_fonts = crate::writer::rename_preserved_fonts(fonts);
-
-                // Replace Font dictionary with renamed version
+                let renamed_fonts = crate::writer::apply_font_rename_map(fonts, preserved_font_map);
                 preserved_writer_dict.set("Font", Object::Dictionary(renamed_fonts));
             }
 

@@ -126,56 +126,303 @@ pub fn rename_preserved_fonts(fonts: &crate::objects::Dictionary) -> crate::obje
 /// let rewritten = rewrite_font_references(content, &mappings);
 /// // Result: b"BT /OrigF1 12 Tf (Hello) Tj ET"
 /// ```
-#[allow(dead_code)] // Will be used in Phase 2.3
 pub fn rewrite_font_references(content: &[u8], mappings: &HashMap<String, String>) -> Vec<u8> {
-    let content_str = String::from_utf8_lossy(content);
-    let mut result = String::new();
+    if mappings.is_empty() {
+        return content.to_vec();
+    }
 
-    for line in content_str.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let mut rewritten_line = String::new();
+    // Tokenize into raw byte spans. Only the bytes of a font name that sits in
+    // the operand position of a `Tf` operator are replaced; every other byte
+    // (whitespace, comments, string/hex literals, inline binary) is copied
+    // verbatim. This is robust to layout the previous line-based rewriter
+    // failed on — e.g. a font operator split across a newline
+    // (`/F1\n12 Tf`) — and never corrupts string/comment content that merely
+    // happens to contain a `/name`.
+    let tokens = tokenize_content(content);
 
-        let mut i = 0;
-        while i < tokens.len() {
-            let token = tokens[i];
-
-            // Check if this is a font name (starts with /) followed by size and Tf
-            if token.starts_with('/') && i + 2 < tokens.len() && tokens[i + 2] == "Tf" {
-                // Extract font name (without leading /)
-                let font_name = &token[1..];
-
-                // Check if we have a mapping for this font
-                if let Some(new_name) = mappings.get(font_name) {
-                    // Write renamed font
-                    rewritten_line.push('/');
-                    rewritten_line.push_str(new_name);
-                } else {
-                    // Keep original font name
-                    rewritten_line.push_str(token);
-                }
-            } else {
-                // Not a font reference, keep as-is
-                rewritten_line.push_str(token);
-            }
-
-            // Add space after token (except for last token)
-            if i < tokens.len() - 1 {
-                rewritten_line.push(' ');
-            }
-
-            i += 1;
+    // Mark the name tokens to rewrite: a Name whose value is in `mappings` and
+    // that is immediately followed (ignoring whitespace/comments) by a Number
+    // and the keyword `Tf`.
+    let mut rewrite: Vec<Option<&String>> = vec![None; tokens.len()];
+    for i in 0..tokens.len() {
+        let tok = &tokens[i];
+        if tok.kind != TokenKind::Name {
+            continue;
         }
-
-        result.push_str(&rewritten_line);
-        result.push('\n');
+        // Name bytes include the leading '/'; strip it for the map lookup.
+        let name = &content[tok.start + 1..tok.end];
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        let Some(new_name) = mappings.get(name) else {
+            continue;
+        };
+        let is_size = tokens
+            .get(i + 1)
+            .is_some_and(|t| t.kind == TokenKind::Number);
+        let is_tf = tokens
+            .get(i + 2)
+            .is_some_and(|t| t.kind == TokenKind::Keyword && &content[t.start..t.end] == b"Tf");
+        if is_size && is_tf {
+            rewrite[i] = Some(new_name);
+        }
     }
 
-    // Remove trailing newline if original didn't have it
-    if !content.ends_with(b"\n") && result.ends_with('\n') {
-        result.pop();
+    // Reassemble, preserving all inter-token bytes verbatim.
+    let mut out = Vec::with_capacity(content.len());
+    let mut pos = 0usize;
+    for (i, tok) in tokens.iter().enumerate() {
+        out.extend_from_slice(&content[pos..tok.start]);
+        match rewrite[i] {
+            Some(new_name) => {
+                out.push(b'/');
+                out.extend_from_slice(new_name.as_bytes());
+            }
+            None => out.extend_from_slice(&content[tok.start..tok.end]),
+        }
+        pos = tok.end;
     }
+    out.extend_from_slice(&content[pos..]);
+    out
+}
 
-    result.into_bytes()
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum TokenKind {
+    Name,
+    Number,
+    Keyword,
+    /// String/hex literal, array/dict delimiter, or any other token that breaks
+    /// a `/name <size> Tf` run.
+    Other,
+}
+
+struct Token {
+    start: usize,
+    end: usize,
+    kind: TokenKind,
+}
+
+/// True for PDF whitespace (ISO 32000-1 Table 1).
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
+/// True for PDF delimiter characters (ISO 32000-1 Table 2).
+fn is_pdf_delimiter(b: u8) -> bool {
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
+}
+
+fn is_regular(b: u8) -> bool {
+    !is_pdf_whitespace(b) && !is_pdf_delimiter(b)
+}
+
+/// Split a content stream into significant tokens, recording each token's byte
+/// span. Whitespace and comments are not emitted as tokens (they are the gaps
+/// between tokens). String and hex literals are consumed whole as `Other` so a
+/// `/name` inside them is never treated as a font reference.
+fn tokenize_content(content: &[u8]) -> Vec<Token> {
+    let n = content.len();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = content[i];
+        if is_pdf_whitespace(c) {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'%' => {
+                // Comment: skip to end of line (gap, not a token).
+                while i < n && content[i] != b'\n' && content[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                // Literal string: balanced parens honouring backslash escapes.
+                let start = i;
+                i += 1;
+                let mut depth = 1;
+                while i < n && depth > 0 {
+                    match content[i] {
+                        b'\\' => i += 1, // skip the escaped byte too
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                tokens.push(Token {
+                    start,
+                    end: i,
+                    kind: TokenKind::Other,
+                });
+            }
+            b'<' => {
+                if i + 1 < n && content[i + 1] == b'<' {
+                    tokens.push(Token {
+                        start: i,
+                        end: i + 2,
+                        kind: TokenKind::Other,
+                    });
+                    i += 2;
+                } else {
+                    // Hex string up to '>'.
+                    let start = i;
+                    i += 1;
+                    while i < n && content[i] != b'>' {
+                        i += 1;
+                    }
+                    if i < n {
+                        i += 1; // consume '>'
+                    }
+                    tokens.push(Token {
+                        start,
+                        end: i,
+                        kind: TokenKind::Other,
+                    });
+                }
+            }
+            b'>' => {
+                let end = if i + 1 < n && content[i + 1] == b'>' {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                tokens.push(Token {
+                    start: i,
+                    end,
+                    kind: TokenKind::Other,
+                });
+                i = end;
+            }
+            b'[' | b']' | b'{' | b'}' | b')' => {
+                tokens.push(Token {
+                    start: i,
+                    end: i + 1,
+                    kind: TokenKind::Other,
+                });
+                i += 1;
+            }
+            b'/' => {
+                let start = i;
+                i += 1;
+                while i < n && is_regular(content[i]) {
+                    i += 1;
+                }
+                tokens.push(Token {
+                    start,
+                    end: i,
+                    kind: TokenKind::Name,
+                });
+            }
+            _ => {
+                let start = i;
+                while i < n && is_regular(content[i]) {
+                    i += 1;
+                }
+                let kind = if is_pdf_number(&content[start..i]) {
+                    TokenKind::Number
+                } else {
+                    TokenKind::Keyword
+                };
+                tokens.push(Token {
+                    start,
+                    end: i,
+                    kind,
+                });
+            }
+        }
+    }
+    tokens
+}
+
+/// True if `bytes` is a PDF numeric token (integer or real, optional sign).
+fn is_pdf_number(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut seen_digit = false;
+    for (idx, &b) in bytes.iter().enumerate() {
+        match b {
+            b'+' | b'-' if idx == 0 => {}
+            b'0'..=b'9' => seen_digit = true,
+            b'.' => {}
+            _ => return false,
+        }
+    }
+    seen_digit
+}
+
+/// Resource keys of the standard Type1 fonts that `write_page_with_fonts`
+/// injects into every page `/Font` dictionary. A preserved font whose resource
+/// key equals one of these is shadowed by the injected stub unless it is
+/// disambiguated (issue #395).
+pub(crate) const INJECTED_BASE_FONT_KEYS: [&str; 12] = [
+    "Helvetica",
+    "Helvetica-Bold",
+    "Helvetica-Oblique",
+    "Helvetica-BoldOblique",
+    "Times-Roman",
+    "Times-Bold",
+    "Times-Italic",
+    "Times-BoldItalic",
+    "Courier",
+    "Courier-Bold",
+    "Courier-Oblique",
+    "Courier-BoldOblique",
+];
+
+/// Build a rename map for preserved fonts, disambiguating ONLY the keys that
+/// collide with `reserved` (the keys already present in the destination page
+/// `/Font` dictionary: the injected base fonts plus any overlay fonts).
+///
+/// Non-colliding keys are absent from the map and keep their original name, so
+/// no content rewrite is performed for them — which is what makes inputs like
+/// `testi.pdf` (all non-base-14 font names) safe. The disambiguated name is
+/// guaranteed unique against both `reserved` and every preserved key, so it can
+/// never introduce a fresh collision.
+pub fn collision_font_mapping<'a>(
+    preserved_keys: impl IntoIterator<Item = &'a str>,
+    reserved: &HashSet<String>,
+) -> HashMap<String, String> {
+    let preserved: Vec<String> = preserved_keys.into_iter().map(|s| s.to_string()).collect();
+    let preserved_set: HashSet<&str> = preserved.iter().map(|s| s.as_str()).collect();
+
+    let mut map: HashMap<String, String> = HashMap::new();
+    for key in &preserved {
+        if !reserved.contains(key) {
+            continue;
+        }
+        let mut candidate = format!("Orig{key}");
+        let mut suffix = 1u32;
+        while reserved.contains(&candidate)
+            || preserved_set.contains(candidate.as_str())
+            || map.values().any(|v| v == &candidate)
+        {
+            candidate = format!("Orig{key}_{suffix}");
+            suffix += 1;
+        }
+        map.insert(key.clone(), candidate);
+    }
+    map
+}
+
+/// Apply a font rename `map` to a preserved font dictionary: keys present in the
+/// map are renamed to their mapped value; every other key (and all values) are
+/// carried over unchanged.
+pub fn apply_font_rename_map(
+    fonts: &crate::objects::Dictionary,
+    map: &HashMap<String, String>,
+) -> crate::objects::Dictionary {
+    let mut out = crate::objects::Dictionary::new();
+    for (key, value) in fonts.iter() {
+        let new_key = map.get(key).cloned().unwrap_or_else(|| key.clone());
+        out.set(new_key, value.clone());
+    }
+    out
 }
 
 /// Check if a font has embedded font data (FontFile/FontFile2/FontFile3)
@@ -533,11 +780,12 @@ mod tests {
         assert!(result.contains("(Text) Tj"));
     }
 
-    // Edge case tests - documenting known limitations
+    // Edge case tests
 
     #[test]
-    fn test_rewrite_font_references_normalizes_whitespace() {
-        // DOCUMENTED LIMITATION: Whitespace is normalized
+    fn test_rewrite_font_references_preserves_whitespace() {
+        // The structure-preserving rewriter (issue #395) only replaces the font
+        // name bytes; all surrounding whitespace is kept verbatim.
         let content = b"BT  /F1   12  Tf  (Text)  Tj  ET"; // Multiple spaces
         let mut mappings = HashMap::new();
         mappings.insert("F1".to_string(), "OrigF1".to_string());
@@ -545,16 +793,13 @@ mod tests {
         let rewritten = rewrite_font_references(content, &mappings);
         let result = String::from_utf8(rewritten).unwrap();
 
-        // Font renamed correctly
-        assert!(result.contains("/OrigF1 12 Tf"));
-        // Whitespace normalized (not "  /OrigF1   12")
-        assert!(!result.contains("  /OrigF1"));
-        // PDF is still valid (single spaces are sufficient)
+        // Only the name changed; the original spacing is preserved exactly.
+        assert_eq!(result, "BT  /OrigF1   12  Tf  (Text)  Tj  ET");
     }
 
     #[test]
     fn test_rewrite_font_references_with_indentation() {
-        // DOCUMENTED LIMITATION: Indentation is lost
+        // Indentation and newlines are preserved (only the name is rewritten).
         let content = b"BT\n  /F1 12 Tf\n  100 700 Td\n  (Text) Tj\nET";
         let mut mappings = HashMap::new();
         mappings.insert("F1".to_string(), "OrigF1".to_string());
@@ -562,10 +807,51 @@ mod tests {
         let rewritten = rewrite_font_references(content, &mappings);
         let result = String::from_utf8(rewritten).unwrap();
 
-        // Font renamed
-        assert!(result.contains("/OrigF1 12 Tf"));
-        // Original indentation lost (becomes single line tokens)
-        // This is acceptable - PDF readers don't care about formatting
+        assert_eq!(result, "BT\n  /OrigF1 12 Tf\n  100 700 Td\n  (Text) Tj\nET");
+    }
+
+    #[test]
+    fn test_rewrite_font_references_cross_line_operator() {
+        // Regression for issue #395: the font name and its size on separate
+        // lines. The old line-based rewriter missed this; the tokenizer-based
+        // one rewrites it and keeps the newline.
+        let content = b"BT\n/F1\n12 Tf (Text) Tj ET";
+        let mut mappings = HashMap::new();
+        mappings.insert("F1".to_string(), "OrigF1".to_string());
+
+        let rewritten = rewrite_font_references(content, &mappings);
+        let result = String::from_utf8(rewritten).unwrap();
+
+        assert_eq!(result, "BT\n/OrigF1\n12 Tf (Text) Tj ET");
+    }
+
+    #[test]
+    fn test_rewrite_font_references_ignores_name_inside_string() {
+        // A `/F1 12 Tf` sequence appearing INSIDE a literal string must not be
+        // rewritten — it is text content, not an operator.
+        let content = b"BT /F1 12 Tf (/F1 12 Tf literal) Tj ET";
+        let mut mappings = HashMap::new();
+        mappings.insert("F1".to_string(), "OrigF1".to_string());
+
+        let rewritten = rewrite_font_references(content, &mappings);
+        let result = String::from_utf8(rewritten).unwrap();
+
+        // The operator is rewritten; the string literal is untouched.
+        assert_eq!(result, "BT /OrigF1 12 Tf (/F1 12 Tf literal) Tj ET");
+    }
+
+    #[test]
+    fn test_rewrite_font_references_real_size_and_negative() {
+        // Font sizes may be reals or signed; both are valid Number operands.
+        let content = b"/F1 12.5 Tf /F2 -8 Tf";
+        let mut mappings = HashMap::new();
+        mappings.insert("F1".to_string(), "OrigF1".to_string());
+        mappings.insert("F2".to_string(), "OrigF2".to_string());
+
+        let rewritten = rewrite_font_references(content, &mappings);
+        let result = String::from_utf8(rewritten).unwrap();
+
+        assert_eq!(result, "/OrigF1 12.5 Tf /OrigF2 -8 Tf");
     }
 
     #[test]
@@ -589,7 +875,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_font_references_with_tabs() {
-        // Tabs are normalized to spaces
+        // Tab separators are valid PDF whitespace and are preserved verbatim.
         let content = b"BT\t/F1\t12\tTf\t(Text)\tTj\tET";
         let mut mappings = HashMap::new();
         mappings.insert("F1".to_string(), "OrigF1".to_string());
@@ -597,8 +883,89 @@ mod tests {
         let rewritten = rewrite_font_references(content, &mappings);
         let result = String::from_utf8(rewritten).unwrap();
 
-        // Font renamed correctly despite tabs
-        assert!(result.contains("/OrigF1 12 Tf"));
+        // Font renamed correctly; tabs kept.
+        assert_eq!(result, "BT\t/OrigF1\t12\tTf\t(Text)\tTj\tET");
+    }
+
+    // Tests for collision_font_mapping (issue #395)
+
+    fn reserved_set(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_collision_mapping_renames_only_colliding_keys() {
+        // /Helvetica collides with the injected base font; /F1 and /Arial do not.
+        let reserved = reserved_set(&INJECTED_BASE_FONT_KEYS);
+        let map = collision_font_mapping(["Helvetica", "F1", "Arial"], &reserved);
+
+        assert_eq!(
+            map.get("Helvetica").map(String::as_str),
+            Some("OrigHelvetica")
+        );
+        assert!(
+            !map.contains_key("F1"),
+            "non-colliding key must not be renamed"
+        );
+        assert!(
+            !map.contains_key("Arial"),
+            "non-colliding key must not be renamed"
+        );
+    }
+
+    #[test]
+    fn test_collision_mapping_empty_when_no_collision() {
+        // The `testi.pdf` class: all font names are non-base-14 → no rename.
+        let reserved = reserved_set(&INJECTED_BASE_FONT_KEYS);
+        let map = collision_font_mapping(["ArialMT", "Arial-BoldMT", "TT0"], &reserved);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_collision_mapping_disambiguates_against_reserved_and_preserved() {
+        // Reserved already contains the naive candidate `OrigHelvetica`, and the
+        // preserved set contains `OrigHelvetica_1`; the mapping must skip both.
+        let mut reserved = reserved_set(&["Helvetica", "OrigHelvetica"]);
+        reserved.insert("Helvetica".to_string());
+        let map = collision_font_mapping(["Helvetica", "OrigHelvetica_1"], &reserved);
+
+        let new_name = map.get("Helvetica").expect("colliding key must be renamed");
+        assert_ne!(new_name, "OrigHelvetica");
+        assert_ne!(new_name, "OrigHelvetica_1");
+        assert!(!reserved.contains(new_name));
+        // `OrigHelvetica_1` is not reserved, so it is not renamed.
+        assert!(!map.contains_key("OrigHelvetica_1"));
+    }
+
+    #[test]
+    fn test_collision_mapping_overlay_font_key() {
+        // A preserved key colliding with an overlay (non-base-14) key is renamed.
+        let reserved = reserved_set(&["CustomOverlay"]);
+        let map = collision_font_mapping(["CustomOverlay"], &reserved);
+        assert_eq!(
+            map.get("CustomOverlay").map(String::as_str),
+            Some("OrigCustomOverlay")
+        );
+    }
+
+    #[test]
+    fn test_apply_font_rename_map_renames_only_mapped_keys() {
+        use crate::objects::{Dictionary, Object};
+
+        let mut fonts = Dictionary::new();
+        fonts.set("Helvetica", Object::Integer(1));
+        fonts.set("F1", Object::Integer(2));
+
+        let mut map = HashMap::new();
+        map.insert("Helvetica".to_string(), "OrigHelvetica".to_string());
+
+        let out = apply_font_rename_map(&fonts, &map);
+
+        assert!(out.contains_key("OrigHelvetica"));
+        assert!(!out.contains_key("Helvetica"));
+        assert!(out.contains_key("F1"), "unmapped key must be kept as-is");
+        assert_eq!(out.get("OrigHelvetica"), Some(&Object::Integer(1)));
+        assert_eq!(out.get("F1"), Some(&Object::Integer(2)));
     }
 
     #[test]
