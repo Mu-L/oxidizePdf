@@ -235,7 +235,12 @@ fn test_memory_exhaustion_protection() {
             Ok(_) => println!("  Large object handled"),
             Err(error) => {
                 println!("  Error (may be expected): {error}");
-                // Should get a proper error, not run out of memory
+                // Should get a proper error, not run out of memory.
+                // Since #374 (recover-by-default), a wrong startxref no longer
+                // fails at xref parsing: the xref is reconstructed and parsing
+                // proceeds until the missing catalog is detected. These synthetic
+                // PDFs have no /Root in the trailer, so "Missing required key: Root"
+                // is the correct graceful terminal error.
                 assert!(
                     error.to_string().contains("too large")
                         || error.to_string().contains("memory")
@@ -245,6 +250,8 @@ fn test_memory_exhaustion_protection() {
                         || error.to_string().contains("Syntax")
                         || error.to_string().contains("xref")
                         || error.to_string().contains("keyword")
+                        || error.to_string().contains("Missing required key"),
+                    "unexpected error kind: {error}"
                 );
             }
         }
