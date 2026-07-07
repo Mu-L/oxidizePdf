@@ -341,21 +341,30 @@ fn test_resolve_stream_length_on_non_stream() {
     let pdf_data = create_minimal_valid_pdf();
     let cursor = Cursor::new(pdf_data);
 
-    if let Ok(mut reader) = PdfReader::new(cursor) {
-        use oxidize_pdf::parser::objects::PdfObject;
+    let mut reader = PdfReader::new(cursor).expect("minimal PDF must parse");
+    use oxidize_pdf::parser::objects::PdfObject;
 
-        let int_obj = PdfObject::Integer(42);
-        let result = reader.resolve_stream_length(&int_obj);
-
-        // Non-stream object should return None
-        if let Ok(None) = result {
-            // Expected
-        } else if result.is_err() {
-            // Also acceptable - exercises error path
-        } else {
-            panic!("Expected None or error, got {:?}", result);
-        }
-    }
+    // A direct non-negative integer IS a valid /Length value.
+    assert_eq!(
+        reader
+            .resolve_stream_length(&PdfObject::Integer(42))
+            .unwrap(),
+        Some(42)
+    );
+    // A negative integer is not a valid length.
+    assert_eq!(
+        reader
+            .resolve_stream_length(&PdfObject::Integer(-5))
+            .unwrap(),
+        None
+    );
+    // A non-numeric object is not a length at all.
+    assert_eq!(
+        reader
+            .resolve_stream_length(&PdfObject::Boolean(true))
+            .unwrap(),
+        None
+    );
 }
 
 // ============================================================================
@@ -738,11 +747,20 @@ startxref
 50
 %%EOF
 ";
+    // #374 recover-by-default: a corrupt xref table is reconstructed by the
+    // object-header scan, so the default reader opens the document. Strict mode
+    // (max_recovery_attempts = 0) still fails loudly.
     let cursor = Cursor::new(malformed_xref);
-    let result = PdfReader::new(cursor);
+    assert!(
+        PdfReader::new(cursor).is_ok(),
+        "default reader must reconstruct a malformed xref"
+    );
 
-    // Should fail with XRef parsing error
-    assert!(result.is_err());
+    let cursor = Cursor::new(malformed_xref);
+    assert!(
+        PdfReader::new_with_options(cursor, ParseOptions::strict()).is_err(),
+        "strict mode must still reject a malformed xref"
+    );
 }
 
 #[test]
@@ -757,11 +775,20 @@ xref
 0000000000 65535 f
 0000000009 00000 n
 ";
+    // #374 recover-by-default: a missing trailer is synthesized from the
+    // reconstructed xref, so the default reader opens the document. Strict mode
+    // still fails loudly.
     let cursor = Cursor::new(no_trailer);
-    let result = PdfReader::new(cursor);
+    assert!(
+        PdfReader::new(cursor).is_ok(),
+        "default reader must synthesize a missing trailer"
+    );
 
-    // Should fail due to missing trailer
-    assert!(result.is_err());
+    let cursor = Cursor::new(no_trailer);
+    assert!(
+        PdfReader::new_with_options(cursor, ParseOptions::strict()).is_err(),
+        "strict mode must still reject a missing trailer"
+    );
 }
 
 #[test]
