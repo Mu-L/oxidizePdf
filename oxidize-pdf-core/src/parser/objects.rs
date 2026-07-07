@@ -496,8 +496,14 @@ impl PdfObject {
         }
     }
 
-    /// Parse the inner dictionary with custom options
-    fn parse_dictionary_inner_with_options<R: Read + std::io::Seek>(
+    /// Parse the inner dictionary with custom options.
+    ///
+    /// Assumes the opening `<<` token has already been consumed and parses key/
+    /// value pairs up to the closing `>>`, WITHOUT attempting to read any
+    /// following `stream` body. `pub(crate)` so xref recovery (Issue #374) can
+    /// extract `/Encrypt`/`/ID` from a cross-reference stream object's dict
+    /// without risking a stream-body parse failure discarding the dictionary.
+    pub(crate) fn parse_dictionary_inner_with_options<R: Read + std::io::Seek>(
         lexer: &mut Lexer<R>,
         options: &super::ParseOptions,
     ) -> ParseResult<PdfDictionary> {
