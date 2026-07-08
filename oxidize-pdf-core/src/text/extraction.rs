@@ -1545,68 +1545,139 @@ impl TextExtractor {
 
     /// Detect columns and re-sort fragments accordingly
     fn detect_and_sort_columns(&self, fragments: &mut [TextFragment]) {
-        // Group fragments by approximate Y position
-        let mut lines: Vec<Vec<&mut TextFragment>> = Vec::new();
-        let mut current_line: Vec<&mut TextFragment> = Vec::new();
-        let mut last_y = f64::INFINITY;
+        // `fragments` arrives pre-sorted by `sort_and_merge_fragments` in reading
+        // order: top-to-bottom by Y band, left-to-right by X within a band.
+        //
+        // Column boundaries are scoped to the row-span of the block that produced
+        // them (issue #403). A page that mixes a small table with unrelated
+        // full-width prose must not apply the table's column gaps to the
+        // paragraph: doing so bucketed the paragraph's per-glyph fragments into
+        // different "columns" by x-position and shredded any token that straddled
+        // a boundary. We therefore only reorder fragments inside a *columnar
+        // block* — a maximal run of consecutive lines that each exhibit an
+        // internal gap wider than `column_threshold` — and leave full-width
+        // "flow" lines in their natural reading order.
 
-        for fragment in fragments.iter_mut() {
-            let fragment_y = fragment.y;
-            if (last_y - fragment_y).abs() > self.options.newline_threshold
+        // Group fragment indices into lines by Y band. Indices (not `&mut`) so we
+        // can later reorder the slice by a computed permutation.
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut current_line: Vec<usize> = Vec::new();
+        let mut last_y = f64::INFINITY;
+        for (i, fragment) in fragments.iter().enumerate() {
+            if (last_y - fragment.y).abs() > self.options.newline_threshold
                 && !current_line.is_empty()
             {
-                lines.push(current_line);
-                current_line = Vec::new();
+                lines.push(std::mem::take(&mut current_line));
             }
-            current_line.push(fragment);
-            last_y = fragment_y;
+            current_line.push(i);
+            last_y = fragment.y;
         }
         if !current_line.is_empty() {
             lines.push(current_line);
         }
 
-        // Detect column boundaries
-        let mut column_boundaries = vec![0.0];
-        for line in &lines {
-            if line.len() > 1 {
-                for i in 0..line.len() - 1 {
-                    let gap = line[i + 1].x - (line[i].x + line[i].width);
+        // A line is "columnar" when it has at least one internal gap wider than
+        // `column_threshold`.
+        let line_is_columnar = |line: &[usize]| -> bool {
+            line.windows(2).any(|w| {
+                let (a, b) = (&fragments[w[0]], &fragments[w[1]]);
+                b.x - (a.x + a.width) > self.options.column_threshold
+            })
+        };
+
+        // Segment lines into blocks: consecutive columnar lines share one segment
+        // id (a multi-line column block); every other line is its own segment.
+        // Segment ids are monotonic top-to-bottom, so a later stable sort keyed on
+        // (segment, column) keeps regions in their original vertical order.
+        let n = fragments.len();
+        let mut segment_of = vec![0usize; n];
+        let mut column_of = vec![0usize; n];
+        let mut has_columnar_block = false;
+        let mut seg_id = 0usize;
+        let mut prev_columnar = false;
+
+        for (li, line) in lines.iter().enumerate() {
+            let columnar = line_is_columnar(line);
+            if li > 0 && !(columnar && prev_columnar) {
+                seg_id += 1;
+            }
+            for &i in line {
+                segment_of[i] = seg_id;
+            }
+            prev_columnar = columnar;
+        }
+
+        // For each columnar block (a segment whose lines are columnar), derive
+        // boundaries from that block's lines only and assign each fragment its
+        // column. Flow segments keep column 0, so the stable sort preserves their
+        // left-to-right reading order untouched.
+        let mut block_start = 0usize;
+        while block_start < lines.len() {
+            if !line_is_columnar(&lines[block_start]) {
+                block_start += 1;
+                continue;
+            }
+            let seg = segment_of[lines[block_start][0]];
+            let mut block_end = block_start;
+            while block_end < lines.len() && segment_of[lines[block_end][0]] == seg {
+                block_end += 1;
+            }
+
+            // Collect boundaries from every line in this block.
+            let mut boundaries = vec![0.0];
+            for line in &lines[block_start..block_end] {
+                for w in line.windows(2) {
+                    let (a, b) = (&fragments[w[0]], &fragments[w[1]]);
+                    let gap = b.x - (a.x + a.width);
                     if gap > self.options.column_threshold {
-                        let boundary = line[i].x + line[i].width + gap / 2.0;
-                        if !column_boundaries
-                            .iter()
-                            .any(|&b| (b - boundary).abs() < 10.0)
-                        {
-                            column_boundaries.push(boundary);
+                        let boundary = a.x + a.width + gap / 2.0;
+                        if !boundaries.iter().any(|&x| (x - boundary).abs() < 10.0) {
+                            boundaries.push(boundary);
                         }
                     }
                 }
             }
-        }
-        column_boundaries.sort_by(|a, b| a.total_cmp(b));
+            boundaries.sort_by(|a, b| a.total_cmp(b));
 
-        // Re-sort fragments by column then Y position
-        if column_boundaries.len() > 1 {
-            fragments.sort_by(|a, b| {
-                // Determine column for each fragment
-                let col_a = column_boundaries
-                    .iter()
-                    .position(|&boundary| a.x < boundary)
-                    .unwrap_or(column_boundaries.len())
-                    - 1;
-                let col_b = column_boundaries
-                    .iter()
-                    .position(|&boundary| b.x < boundary)
-                    .unwrap_or(column_boundaries.len())
-                    - 1;
-
-                if col_a != col_b {
-                    col_a.cmp(&col_b)
-                } else {
-                    // Same column, sort by Y position
-                    b.y.total_cmp(&a.y)
+            if boundaries.len() > 1 {
+                has_columnar_block = true;
+                for line in &lines[block_start..block_end] {
+                    for &i in line {
+                        // Column = index of the last boundary not exceeding x.
+                        // `boundaries[0]` is 0.0; a fragment drawn off-page-left
+                        // (x < 0) saturates to column 0 rather than underflowing.
+                        let col = boundaries
+                            .iter()
+                            .position(|&boundary| fragments[i].x < boundary)
+                            .map_or(boundaries.len() - 1, |p| p.saturating_sub(1));
+                        column_of[i] = col;
+                    }
                 }
-            });
+            }
+            block_start = block_end;
+        }
+
+        // No columnar block → nothing to reorder; the reading-order sort stands.
+        if !has_columnar_block {
+            return;
+        }
+
+        // Stable permutation by (segment, column), tie-broken by original index so
+        // reading order is preserved within each (segment, column) — top-to-bottom
+        // then left-to-right, i.e. column-major within a block.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&i, &j| {
+            segment_of[i]
+                .cmp(&segment_of[j])
+                .then(column_of[i].cmp(&column_of[j]))
+                .then(i.cmp(&j))
+        });
+
+        // Materialize the permuted order once (one clone per fragment), then move
+        // each element back into place — avoids a second full-slice clone.
+        let reordered: Vec<TextFragment> = order.iter().map(|&i| fragments[i].clone()).collect();
+        for (slot, frag) in fragments.iter_mut().zip(reordered) {
+            *slot = frag;
         }
     }
 
