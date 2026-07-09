@@ -103,6 +103,8 @@ pub struct DetectedTable {
     pub columns: usize,
     /// Confidence score (0.0 to 1.0)
     pub confidence: f64,
+    /// Leading header rows (0 until header detection runs; Task 8).
+    pub header_rows: usize,
 }
 
 impl DetectedTable {
@@ -115,6 +117,7 @@ impl DetectedTable {
             rows,
             columns,
             confidence,
+            header_rows: 0,
         }
     }
 
@@ -169,6 +172,10 @@ pub struct TableCell {
     pub text: String,
     /// Whether this cell has borders
     pub has_borders: bool,
+    /// Number of base rows this cell spans (>= 1).
+    pub row_span: usize,
+    /// Number of base columns this cell spans (>= 1).
+    pub col_span: usize,
 }
 
 impl TableCell {
@@ -180,6 +187,8 @@ impl TableCell {
             bbox,
             text: String::new(),
             has_borders: false,
+            row_span: 1,
+            col_span: 1,
         }
     }
 
