@@ -1538,7 +1538,10 @@ impl TextExtractor {
             while line_end < n {
                 let frag = &fragments[order[line_end]];
                 let tol = head_h.min(frag.height) * 0.2;
-                if (head_y - frag.y).abs() >= tol {
+                // Negated `< tol` (not `>= tol`) so a non-finite Y from a
+                // degenerate text matrix forces a line break instead of a
+                // NaN comparison silently swallowing every remaining fragment.
+                if !((head_y - frag.y).abs() < tol) {
                     break;
                 }
                 line_end += 1;
@@ -3959,5 +3962,34 @@ mod tests {
         let props = MarkedContentProps::ResourceRef("PropsName".to_string());
         let (mcid, _) = super::resolve_props(&props, Some(&properties));
         assert_eq!(mcid, None);
+    }
+
+    #[test]
+    fn sort_and_merge_fragments_nan_y_does_not_swallow_other_lines() {
+        // A fragment with a non-finite Y (reachable from a degenerate text
+        // matrix in a malformed PDF) must not chain every remaining fragment
+        // into one pseudo-line. The tolerance filter compares with `< tol`; a
+        // `>= tol` phrasing would let a NaN anchor never terminate the line,
+        // collapsing the whole page into a single X-sorted "line".
+        let extractor = TextExtractor::with_options(ExtractionOptions::default());
+
+        // Four well-separated lines whose X order is the reverse of their Y
+        // (reading) order: if the NaN anchor swallows the rest, they get
+        // re-sorted purely by X into D,C,B,A instead of the reading order.
+        let mut fragments = vec![
+            tf("A", 400.0, f64::NAN, 10.0, 12.0),
+            tf("B", 300.0, 500.0, 10.0, 12.0),
+            tf("C", 200.0, 300.0, 10.0, 12.0),
+            tf("D", 100.0, 100.0, 10.0, 12.0),
+        ];
+        extractor.sort_and_merge_fragments(&mut fragments);
+
+        let order: Vec<&str> = fragments.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["A", "B", "C", "D"],
+            "NaN-Y fragment must stay its own line; the finite lines keep \
+             top-to-bottom reading order instead of collapsing to X order"
+        );
     }
 }
