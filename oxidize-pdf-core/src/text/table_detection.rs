@@ -42,6 +42,9 @@
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! Merged cells are detected from absent grid dividers; borderless tables and un-tagged
+//! multi-level headers stay flat. See `docs/TABLE_DETECTION_GUIDE.md` for the full limits.
 
 use crate::graphics::extraction::{ExtractedGraphics, LineOrientation, VectorLine};
 use crate::text::extraction::TextFragment;
