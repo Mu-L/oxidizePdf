@@ -215,3 +215,142 @@ fn header_rows_two_when_top_two_of_three_rows_tagged() {
         "top two tagged rows must both count as header rows"
     );
 }
+
+/// Issue #375 Task 7 (final-review I2/T7d): vertical merge coverage.
+///
+/// Grid: X gridlines 100/200/300 (2 cols); Y gridlines 100/150/200 (2 row
+/// bands, row 0 = top). The middle horizontal divider at y=150 is drawn only
+/// over the RIGHT column (x 200..300); it is absent over the LEFT column
+/// (x 100..200). `divider_present_horizontal` therefore reports the divider
+/// missing on the left, so the two left-column base cells merge vertically
+/// into one `row_span == 2` cell, while the right column — where the divider
+/// is present — keeps two separate `row_span == 1` cells.
+#[test]
+fn merged_cell_detected_with_row_span_2() {
+    let h = vec![
+        hline(100.0, 300.0, 100.0), // bottom border
+        hline(200.0, 300.0, 150.0), // middle divider, RIGHT column only
+        hline(100.0, 300.0, 200.0), // top border
+    ];
+    let v = vec![
+        vline(100.0, 100.0, 200.0), // left border (full height)
+        vline(200.0, 100.0, 200.0), // middle vertical (full height, both rows)
+        vline(300.0, 100.0, 200.0), // right border (full height)
+    ];
+    let graphics = build_graphics(h, v);
+    let frags = vec![
+        frag("Left", 130.0, 150.0),
+        frag("TopRight", 230.0, 170.0),
+        frag("BottomRight", 230.0, 120.0),
+    ];
+
+    let det = TableDetector::default();
+    let tables = det.detect(&graphics, &frags).expect("detect");
+    let table = tables.first().expect("one table");
+
+    // Base grid dimensions stay 2x2.
+    assert_eq!(table.rows, 2, "base grid rows");
+    assert_eq!(table.columns, 2, "base grid columns");
+
+    let left = table
+        .cells
+        .iter()
+        .find(|c| c.row == 0 && c.column == 0)
+        .expect("cell 0,0");
+    assert_eq!(left.row_span, 2, "left column should span 2 rows");
+    assert_eq!(left.col_span, 1, "left merged cell spans a single column");
+
+    // The vertical merge must not leave a separate cell at (1,0).
+    assert!(
+        !table.cells.iter().any(|c| c.row == 1 && c.column == 0),
+        "interior position of a vertically merged cell must be omitted"
+    );
+
+    // The right column keeps two single (unmerged) cells.
+    assert!(
+        table
+            .cells
+            .iter()
+            .any(|c| c.row == 0 && c.column == 1 && c.row_span == 1 && c.col_span == 1),
+        "top-right single cell"
+    );
+    assert!(
+        table
+            .cells
+            .iter()
+            .any(|c| c.row == 1 && c.column == 1 && c.row_span == 1 && c.col_span == 1),
+        "bottom-right single cell"
+    );
+}
+
+/// Issue #375 Task 7 (final-review I2/T7d): transitive multi-cell merge
+/// coverage.
+///
+/// Grid: X gridlines 100/200/300/400 (3 cols); Y gridlines 100/150/200 (2 row
+/// bands). In the TOP row band (y 150..200) BOTH interior verticals (x=200
+/// and x=300) are absent — each is drawn only over the BOTTOM band
+/// (y 100..150) — so all three top-row base cells merge transitively
+/// (0-1 absent, 1-2 absent -> union-find connects all three) into one
+/// `col_span == 3` cell. The bottom row keeps both interior verticals, so it
+/// stays as three separate `col_span == 1` cells.
+#[test]
+fn transitive_merge_across_three_columns_detected() {
+    let h = vec![
+        hline(100.0, 400.0, 100.0), // bottom border
+        hline(100.0, 400.0, 150.0), // middle divider, full width
+        hline(100.0, 400.0, 200.0), // top border
+    ];
+    let v = vec![
+        vline(100.0, 100.0, 200.0), // left border (full height)
+        vline(400.0, 100.0, 200.0), // right border (full height)
+        vline(200.0, 100.0, 150.0), // interior divider 1, BOTTOM band only
+        vline(300.0, 100.0, 150.0), // interior divider 2, BOTTOM band only
+    ];
+    let graphics = build_graphics(h, v);
+    let frags = vec![
+        frag("Top", 250.0, 170.0),
+        frag("A", 130.0, 120.0),
+        frag("B", 230.0, 120.0),
+        frag("C", 330.0, 120.0),
+    ];
+
+    let det = TableDetector::default();
+    let tables = det.detect(&graphics, &frags).expect("detect");
+    let table = tables.first().expect("one table");
+
+    // Base grid dimensions stay 2x3.
+    assert_eq!(table.rows, 2, "base grid rows");
+    assert_eq!(table.columns, 3, "base grid columns");
+
+    let top = table
+        .cells
+        .iter()
+        .find(|c| c.row == 0 && c.column == 0)
+        .expect("cell 0,0");
+    assert_eq!(
+        top.col_span, 3,
+        "top row should transitively merge 3 columns"
+    );
+    assert_eq!(top.row_span, 1, "top merged cell spans a single row");
+
+    // The transitive merge must not leave separate cells at (0,1) or (0,2).
+    assert!(
+        !table.cells.iter().any(|c| c.row == 0 && c.column == 1),
+        "interior position (0,1) of the merged cell must be omitted"
+    );
+    assert!(
+        !table.cells.iter().any(|c| c.row == 0 && c.column == 2),
+        "interior position (0,2) of the merged cell must be omitted"
+    );
+
+    // The bottom row keeps three single (unmerged) cells.
+    for col in 0..3 {
+        assert!(
+            table
+                .cells
+                .iter()
+                .any(|c| { c.row == 1 && c.column == col && c.row_span == 1 && c.col_span == 1 }),
+            "bottom row cell at column {col} should remain unmerged"
+        );
+    }
+}
