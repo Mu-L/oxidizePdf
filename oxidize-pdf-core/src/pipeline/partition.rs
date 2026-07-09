@@ -421,14 +421,19 @@ impl Partitioner {
                                 },
                             }));
 
-                            // Claim fragments that fall within this table's bounding box.
+                            // #375: claim only fragments inside a populated cell.
                             for (i, f) in fragments.iter().enumerate() {
-                                if !claimed[i]
-                                    && f.x >= table.bounding_box.x - 1.0
-                                    && f.x <= table.bounding_box.right() + 1.0
-                                    && f.y >= table.bounding_box.y - 1.0
-                                    && f.y <= table.bounding_box.top() + 1.0
-                                {
+                                if claimed[i] {
+                                    continue;
+                                }
+                                let cx = f.x + f.width / 2.0;
+                                let cy = f.y + f.height / 2.0;
+                                let in_cell = table
+                                    .rows
+                                    .iter()
+                                    .flat_map(|r| &r.cells)
+                                    .any(|c| !c.is_empty() && c.bounding_box.contains(cx, cy));
+                                if in_cell {
                                     claimed[i] = true;
                                 }
                             }
