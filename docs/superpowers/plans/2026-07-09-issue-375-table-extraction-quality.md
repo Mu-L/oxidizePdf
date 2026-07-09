@@ -275,11 +275,13 @@ git commit -m "fix(#375): spatial tables claim only populated-cell fragments"
 Ruling path — after the `if table.confidence < ... { continue; }` at ~324, add:
 
 ```rust
-                                // #375: a table that captured too few cells is not a
-                                // table — skip it so its fragments become prose.
+                                // #375: a table with fewer than 2 populated cells is not a
+                                // real table — skip it so its fragments become prose.
+                                // (Softened from `populated < rows` after Task 4 review found
+                                // that threshold over-rejected legitimately sparse narrow tables;
+                                // human-approved 2026-07-09.)
                                 let populated = table.cells.iter().filter(|c| !c.text.is_empty()).count();
-                                if populated < table.rows.max(1) {
-                                    // fewer populated cells than rows => no real column structure
+                                if populated < 2 {
                                     continue;
                                 }
 ```
@@ -287,9 +289,10 @@ Ruling path — after the `if table.confidence < ... { continue; }` at ~324, add
 Spatial path — after its confidence gate at ~392, add:
 
 ```rust
+                            // #375: same near-empty guard for the spatial path.
                             let populated = table.rows.iter().flat_map(|r| &r.cells)
                                 .filter(|c| !c.is_empty()).count();
-                            if populated < table.row_count().max(1) {
+                            if populated < 2 {
                                 continue;
                             }
 ```
