@@ -174,3 +174,44 @@ fn header_row_defaults_to_top_row_without_tags() {
         "no tags present: must default to top-row fallback"
     );
 }
+
+/// Issue #375 Task 8: a fully-ruled 3x2 table with the TOP TWO rows tagged
+/// `TH` must report `header_rows == 2`. This is discriminating from the
+/// untagged `rows >= 2 -> 1` fallback: a broken tag-matching path can only
+/// ever produce 1 here, never 2.
+#[test]
+fn header_rows_two_when_top_two_of_three_rows_tagged() {
+    let h = vec![
+        hline(100.0, 300.0, 100.0),
+        hline(100.0, 300.0, 140.0),
+        hline(100.0, 300.0, 180.0),
+        hline(100.0, 300.0, 220.0),
+    ];
+    let v = vec![
+        vline(100.0, 100.0, 220.0),
+        vline(200.0, 100.0, 220.0),
+        vline(300.0, 100.0, 220.0),
+    ];
+    let graphics = build_graphics(h, v);
+    let frags = vec![
+        // Top row (row 0), tagged.
+        th("H1", 130.0, 200.0),
+        th("H2", 230.0, 200.0),
+        // Middle row (row 1), tagged.
+        th("H3", 130.0, 160.0),
+        th("H4", 230.0, 160.0),
+        // Bottom row (row 2), plain.
+        frag("a", 130.0, 120.0),
+        frag("b", 230.0, 120.0),
+    ];
+
+    let tables = TableDetector::default()
+        .detect(&graphics, &frags)
+        .expect("detect");
+    let table = tables.first().expect("one table");
+    assert_eq!(table.rows, 3, "base grid rows");
+    assert_eq!(
+        table.header_rows, 2,
+        "top two tagged rows must both count as header rows"
+    );
+}
