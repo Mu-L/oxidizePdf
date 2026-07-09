@@ -1,7 +1,8 @@
 use crate::graphics::extraction::ExtractedGraphics;
 use crate::pipeline::reading_order::{ReadingOrder, SimpleReadingOrder, XYCutReadingOrder};
 use crate::pipeline::{
-    Element, ElementBBox, ElementData, ElementMetadata, KeyValueElementData, TableElementData,
+    Element, ElementBBox, ElementData, ElementMetadata, KeyValueElementData, RichCell,
+    TableElementData, TableStructure,
 };
 use crate::text::extraction::TextFragment;
 
@@ -331,23 +332,21 @@ impl Partitioner {
                                 if populated < 2 {
                                     continue;
                                 }
-                                let rows = ruling_table_to_rows(table);
                                 let bbox = ElementBBox::new(
                                     table.bbox.x,
                                     table.bbox.y,
                                     table.bbox.width,
                                     table.bbox.height,
                                 );
-                                elements.push(Element::Table(TableElementData {
-                                    rows,
-                                    structure: None,
-                                    metadata: ElementMetadata {
+                                elements.push(Element::Table(TableElementData::from_structure(
+                                    ruling_table_to_structure(table),
+                                    ElementMetadata {
                                         page,
                                         bbox,
                                         confidence: table.confidence,
                                         ..Default::default()
                                     },
-                                }));
+                                )));
                                 // #375: claim only fragments actually placed in a
                                 // cell. Fragments inside the table bbox but in no
                                 // cell (gaps, borders, normalization misses) stay
@@ -785,16 +784,31 @@ fn is_list_item(text: &str) -> bool {
     false
 }
 
-/// Flatten a ruling-detected table into row-major `Vec<Vec<String>>`, filling
-/// absent cells with empty strings.
-fn ruling_table_to_rows(table: &crate::text::table_detection::DetectedTable) -> Vec<Vec<String>> {
-    let mut grid = vec![vec![String::new(); table.columns]; table.rows];
-    for cell in &table.cells {
-        if cell.row < table.rows && cell.column < table.columns {
-            grid[cell.row][cell.column] = cell.text.clone();
-        }
+/// Convert a ruling-detected table (with merged cells + header rows) into a
+/// rich `TableStructure`. The flat `rows` view is derived by
+/// `TableElementData::from_structure`.
+fn ruling_table_to_structure(
+    table: &crate::text::table_detection::DetectedTable,
+) -> TableStructure {
+    let header_rows = table.header_rows;
+    let cells = table
+        .cells
+        .iter()
+        .map(|c| RichCell {
+            row: c.row,
+            col: c.column,
+            row_span: c.row_span.max(1),
+            col_span: c.col_span.max(1),
+            text: c.text.clone(),
+            is_header: c.row < header_rows,
+        })
+        .collect();
+    TableStructure {
+        cells,
+        num_rows: table.rows,
+        num_cols: table.columns,
+        header_rows,
     }
-    grid
 }
 
 /// Splits unclaimed fragments into Y-separated table candidate regions.
