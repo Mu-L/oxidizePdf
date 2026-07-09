@@ -41,6 +41,7 @@ fn test_element_table_creation() {
             vec!["1".to_string(), "2".to_string(), "3".to_string()],
             vec!["X".to_string(), "Y".to_string(), "Z".to_string()],
         ],
+        structure: None,
         metadata: ElementMetadata {
             page: 1,
             ..Default::default()
@@ -67,6 +68,7 @@ fn test_element_variants_exhaustive() {
         Element::Paragraph(data()),
         Element::Table(TableElementData {
             rows: vec![],
+            structure: None,
             metadata: ElementMetadata::default(),
         }),
         Element::Header(data()),
@@ -210,6 +212,7 @@ fn test_element_display_text_table() {
             vec!["Name".to_string(), "Age".to_string()],
             vec!["Alice".to_string(), "30".to_string()],
         ],
+        structure: None,
         metadata: ElementMetadata::default(),
     });
 

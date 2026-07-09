@@ -398,6 +398,7 @@ fn test_element_type_names_for_all_variants() {
             "table",
             Element::Table(TableElementData {
                 rows: vec![vec!["a".into()]],
+                structure: None,
                 metadata: md.clone(),
             }),
         ),

@@ -411,6 +411,7 @@ mod tests {
     fn table_el() -> Element {
         Element::Table(crate::pipeline::element::TableElementData {
             rows: vec![],
+            structure: None,
             metadata: crate::pipeline::element::ElementMetadata::default(),
         })
     }
@@ -631,6 +632,7 @@ mod tests {
                 .into_iter()
                 .map(|r| r.into_iter().map(String::from).collect())
                 .collect(),
+            structure: None,
             metadata: ElementMetadata::default(),
         })
     }

@@ -44,6 +44,7 @@ fn make_small_table() -> Element {
             vec!["Row 1A".to_string(), "Row 1B".to_string()],
             vec!["Row 2A".to_string(), "Row 2B".to_string()],
         ],
+        structure: None,
         metadata: ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 400.0, 400.0, 100.0),
@@ -228,6 +229,7 @@ fn test_table_oversized_remains_atomic_not_split() {
         .collect();
     let elements = vec![Element::Table(TableElementData {
         rows: big_rows,
+        structure: None,
         metadata: ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 300.0, 400.0, 400.0),

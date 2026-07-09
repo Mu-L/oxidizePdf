@@ -212,13 +212,64 @@ pub struct ElementData {
     pub metadata: ElementMetadata,
 }
 
+/// One cell of a table's rich structure. `row`/`col` are the cell's top-left
+/// position in the base grid; `row_span`/`col_span` are >= 1.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "semantic", derive(Serialize, Deserialize))]
+pub struct RichCell {
+    pub row: usize,
+    pub col: usize,
+    pub row_span: usize,
+    pub col_span: usize,
+    pub text: String,
+    pub is_header: bool,
+}
+
+/// Rich table structure: merged cells and header rows. Present only when a hard
+/// signal (drawn grid / structure tags) revealed it; borderless tables leave it
+/// `None` and use the flat `rows` view only.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "semantic", derive(Serialize, Deserialize))]
+pub struct TableStructure {
+    pub cells: Vec<RichCell>,
+    pub num_rows: usize,
+    pub num_cols: usize,
+    /// Number of leading rows that are headers (0 = none, 1 = single header row,
+    /// >1 = multi-level header expressed as header rows + merged cells).
+    pub header_rows: usize,
+}
+
 /// Data specific to table elements.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "semantic", derive(Serialize, Deserialize))]
 pub struct TableElementData {
-    /// Row-major cell data. Each inner Vec is one row.
+    /// Row-major flat cell data. Each inner Vec is one row. When `structure` is
+    /// present this is its expanded (span-repeated) view; otherwise it is the
+    /// primary representation.
     pub rows: Vec<Vec<String>>,
+    /// Rich structure (merged cells / header rows) when a hard signal revealed it.
+    pub structure: Option<TableStructure>,
     pub metadata: ElementMetadata,
+}
+
+impl TableElementData {
+    /// Build from rich structure, deriving the flat `rows` view by expanding each
+    /// spanning cell's text across every covered (row, col).
+    pub fn from_structure(structure: TableStructure, metadata: ElementMetadata) -> Self {
+        let mut rows = vec![vec![String::new(); structure.num_cols]; structure.num_rows];
+        for cell in &structure.cells {
+            for r in cell.row..(cell.row + cell.row_span).min(structure.num_rows) {
+                for c in cell.col..(cell.col + cell.col_span).min(structure.num_cols) {
+                    rows[r][c] = cell.text.clone();
+                }
+            }
+        }
+        Self {
+            rows,
+            structure: Some(structure),
+            metadata,
+        }
+    }
 }
 
 /// Data specific to image elements.

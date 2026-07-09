@@ -340,6 +340,7 @@ impl Partitioner {
                                 );
                                 elements.push(Element::Table(TableElementData {
                                     rows,
+                                    structure: None,
                                     metadata: ElementMetadata {
                                         page,
                                         bbox,
@@ -432,6 +433,7 @@ impl Partitioner {
 
                             elements.push(Element::Table(TableElementData {
                                 rows,
+                                structure: None,
                                 metadata: ElementMetadata {
                                     page,
                                     bbox,

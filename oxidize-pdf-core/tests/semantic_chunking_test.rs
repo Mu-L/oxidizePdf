@@ -69,6 +69,7 @@ fn test_semantic_chunk_table_stays_whole() {
                 vec!["1".into(), "2".into()],
                 vec!["3".into(), "4".into()],
             ],
+            structure: None,
             metadata: ElementMetadata {
                 page: 0,
                 bbox: ElementBBox::new(50.0, 600.0, 400.0, 100.0),
@@ -95,6 +96,7 @@ fn test_semantic_chunk_large_table_allowed_to_overflow() {
         rows: (0..50)
             .map(|i| vec![format!("cell_{}_0", i), format!("cell_{}_1", i)])
             .collect(),
+        structure: None,
         metadata: ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 100.0, 400.0, 500.0),

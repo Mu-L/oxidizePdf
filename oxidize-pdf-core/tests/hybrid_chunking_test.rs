@@ -200,6 +200,7 @@ fn test_oversized_table_gets_own_oversized_chunk() {
         para_with_heading("Before table.", 0, 750.0, None),
         Element::Table(TableElementData {
             rows: big_rows,
+            structure: None,
             metadata: ElementMetadata {
                 page: 0,
                 bbox: ElementBBox::new(50.0, 300.0, 400.0, 400.0),

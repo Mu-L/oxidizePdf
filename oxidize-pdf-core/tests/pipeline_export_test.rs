@@ -62,6 +62,7 @@ fn test_export_table_pipe_format() {
             vec!["Alice".to_string(), "30".to_string()],
             vec!["Bob".to_string(), "25".to_string()],
         ],
+        structure: None,
         metadata: meta(),
     })];
     let output = exporter.export(&elements);
