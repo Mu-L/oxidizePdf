@@ -340,17 +340,20 @@ impl Partitioner {
                                         ..Default::default()
                                     },
                                 }));
-                                let (rx, ry) = (table.bbox.x, table.bbox.y);
-                                let (rr, rt) = (
-                                    table.bbox.x + table.bbox.width,
-                                    table.bbox.y + table.bbox.height,
-                                );
+                                // #375: claim only fragments actually placed in a
+                                // cell. Fragments inside the table bbox but in no
+                                // cell (gaps, borders, normalization misses) stay
+                                // unclaimed and fall through to prose classification.
                                 for (i, f) in fragments.iter().enumerate() {
-                                    if !claimed[i]
-                                        && f.x >= rx - 1.0
-                                        && f.x <= rr + 1.0
-                                        && f.y >= ry - 1.0
-                                        && f.y <= rt + 1.0
+                                    if claimed[i] {
+                                        continue;
+                                    }
+                                    let cx = f.x + f.width / 2.0;
+                                    let cy = f.y + f.height / 2.0;
+                                    if table
+                                        .cells
+                                        .iter()
+                                        .any(|cell| cell.bbox.contains_point(cx, cy))
                                     {
                                         claimed[i] = true;
                                     }
