@@ -106,3 +106,71 @@ fn merged_header_cell_detected_with_col_span_2() {
         "bottom-right single cell"
     );
 }
+
+/// Same fragment as `frag`, but tagged as a table-header structure element.
+fn th(t: &str, x: f64, y: f64) -> TextFragment {
+    let mut f = frag(t, x, y);
+    f.struct_tag = Some("TH".to_string());
+    f
+}
+
+/// Issue #375 Task 8: a fully-ruled 2x2 table whose top row is tagged `TH`
+/// must report `header_rows == 1`; the untagged bottom row must not count.
+#[test]
+fn header_row_detected_from_th_tag() {
+    let h = vec![
+        hline(100.0, 300.0, 100.0),
+        hline(100.0, 300.0, 150.0),
+        hline(100.0, 300.0, 200.0),
+    ];
+    let v = vec![
+        vline(100.0, 100.0, 200.0),
+        vline(200.0, 100.0, 200.0),
+        vline(300.0, 100.0, 200.0),
+    ];
+    let graphics = build_graphics(h, v);
+    let frags = vec![
+        th("H1", 130.0, 170.0),
+        th("H2", 230.0, 170.0),
+        frag("a", 130.0, 120.0),
+        frag("b", 230.0, 120.0),
+    ];
+
+    let tables = TableDetector::default()
+        .detect(&graphics, &frags)
+        .expect("detect");
+    let table = tables.first().expect("one table");
+    assert_eq!(table.header_rows, 1, "top row tagged TH must be the header");
+}
+
+/// Issue #375 Task 8: with no structure tags at all, a >=2-row bordered
+/// table still defaults `header_rows` to 1 (top row fallback).
+#[test]
+fn header_row_defaults_to_top_row_without_tags() {
+    let h = vec![
+        hline(100.0, 300.0, 100.0),
+        hline(100.0, 300.0, 150.0),
+        hline(100.0, 300.0, 200.0),
+    ];
+    let v = vec![
+        vline(100.0, 100.0, 200.0),
+        vline(200.0, 100.0, 200.0),
+        vline(300.0, 100.0, 200.0),
+    ];
+    let graphics = build_graphics(h, v);
+    let frags = vec![
+        frag("H1", 130.0, 170.0),
+        frag("H2", 230.0, 170.0),
+        frag("a", 130.0, 120.0),
+        frag("b", 230.0, 120.0),
+    ];
+
+    let tables = TableDetector::default()
+        .detect(&graphics, &frags)
+        .expect("detect");
+    let table = tables.first().expect("one table");
+    assert_eq!(
+        table.header_rows, 1,
+        "no tags present: must default to top-row fallback"
+    );
+}

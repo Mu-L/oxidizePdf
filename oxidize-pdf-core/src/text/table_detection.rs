@@ -346,9 +346,59 @@ impl TableDetector {
         let num_rows = grid.rows.len().saturating_sub(1);
         let num_cols = grid.columns.len().saturating_sub(1);
 
-        let table = DetectedTable::new(bbox, cells_with_text, num_rows, num_cols);
+        let mut table = DetectedTable::new(bbox, cells_with_text, num_rows, num_cols);
+        table.header_rows = Self::count_header_rows(&table, text_fragments);
 
         Ok(Some(table))
+    }
+
+    /// Counts the leading contiguous header rows of a detected table
+    /// (issue #375, Task 8).
+    ///
+    /// A row is a header row when at least one text fragment landing inside
+    /// one of its cells carries a header structure tag (`"TH"`, or any tag
+    /// containing `"HEADER"`, case-insensitively — e.g. PDF/UA `"TH"` cells
+    /// or a custom `"TableHeader"` role). Only *leading* tagged rows count:
+    /// counting stops at the first row without a header-tagged fragment, so
+    /// a tagged row that is not contiguous with the top does not count.
+    ///
+    /// When no rows carry a header tag, a bordered table with at least two
+    /// rows falls back to treating the top row as the header (the common
+    /// convention for ruled tables without structure information).
+    fn count_header_rows(table: &DetectedTable, fragments: &[TextFragment]) -> usize {
+        fn is_header_tag(tag: &str) -> bool {
+            let t = tag.to_ascii_uppercase();
+            t == "TH" || t.contains("HEADER")
+        }
+
+        let mut tagged_leading = 0usize;
+        for r in 0..table.rows {
+            let row_cells: Vec<&TableCell> = table
+                .cells
+                .iter()
+                .filter(|c| c.row <= r && r < c.row + c.row_span)
+                .collect();
+            let has_header = fragments.iter().any(|f| {
+                f.struct_tag.as_deref().map(is_header_tag).unwrap_or(false)
+                    && row_cells.iter().any(|c| {
+                        c.bbox
+                            .contains_point(f.x + f.width / 2.0, f.y + f.height / 2.0)
+                    })
+            });
+            if has_header {
+                tagged_leading = r + 1;
+            } else {
+                break;
+            }
+        }
+
+        if tagged_leading > 0 {
+            tagged_leading
+        } else if table.rows >= 2 {
+            1
+        } else {
+            0
+        }
     }
 
     /// Detects a grid pattern from horizontal and vertical lines.
