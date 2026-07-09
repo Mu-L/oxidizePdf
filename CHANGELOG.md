@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+### BREAKING CHANGES
+
+- `TableElementData` (`oxidize_pdf::pipeline`), and `DetectedTable` / `TableCell`
+  (`oxidize_pdf::text::table_detection`) are now `#[non_exhaustive]` and gained new public
+  fields (rich table structure / cell spans / header rows). External code can no longer
+  construct these with a struct literal or match them exhaustively. Migration: build
+  `TableElementData` via `TableElementData::new(rows, metadata)` (flat) or
+  `TableElementData::from_structure(structure, metadata)` (rich); build `TableCell` via
+  `TableCell::new(..)` and `DetectedTable` via `DetectedTable::new(..)`. (#375)
+
+### Added
+
+- **RAG table extraction quality (#375).** Merged cells (rowspan/colspan) and header rows are
+  now represented by a rich `TableStructure` / `RichCell` model on `TableElementData.structure`,
+  populated from hard signals — drawn-grid dividers (merged cells) and PDF structure tags
+  (header rows). The flat `rows` view is derived from it (spanned values repeated). GFM export
+  collapses multi-level headers (joined with `›`) and repeats merged-cell values; RAG chunk
+  metadata (`table_rows`/`table_cols`) counts the rich geometry. Borderless tables and
+  un-tagged multi-level headers remain flat — see `docs/TABLE_DETECTION_GUIDE.md`.
+
+### Fixed
+
+- **Table detection no longer silently drops page text (#375).** A detected table now claims
+  only fragments it actually placed in a cell (both ruling and spatial detectors); text inside
+  the table bounding box but not in any cell falls back to prose instead of being discarded.
+  Near-empty tables (< 2 populated cells) decompose to prose. Guarded by a text-conservation
+  invariant test.
+
 ## [3.1.1] - 2026-07-07
 
 ### Fixed

@@ -198,14 +198,14 @@ fn test_oversized_table_gets_own_oversized_chunk() {
 
     let elements = vec![
         para_with_heading("Before table.", 0, 750.0, None),
-        Element::Table(TableElementData {
-            rows: big_rows,
-            metadata: ElementMetadata {
+        Element::Table(TableElementData::new(
+            big_rows,
+            ElementMetadata {
                 page: 0,
                 bbox: ElementBBox::new(50.0, 300.0, 400.0, 400.0),
                 ..Default::default()
             },
-        }),
+        )),
         para_with_heading("After table.", 0, 100.0, None),
     ];
 

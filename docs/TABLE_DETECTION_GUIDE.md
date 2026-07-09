@@ -596,3 +596,22 @@ https://github.com/BelowZero/oxidize-pdf/issues
 **Version**: 1.6.3
 **Last Updated**: 2025-10-22
 **License**: MIT
+
+## Known limitations (as of #375)
+
+Rich table structure — merged cells and multi-level headers — is only produced when a
+**hard signal** reveals it:
+
+- **Merged cells** are detected from the drawn grid: where an internal dividing line is
+  absent, the adjacent cells are merged. Tables without drawn borders ("borderless") are
+  returned as a flat grid with no merged-cell information.
+- **Multi-level headers** are represented as header rows containing merged cells (e.g. a
+  "Region" header spanning two columns above "Q1"/"Q2"). Header rows are identified from the
+  PDF's structure tags when the document is tagged, otherwise the top row is assumed to be
+  the header. A nested header *hierarchy* is not read from the PDF's internal structure tree.
+- **Borderless-table detection is intrinsically ambiguous** and best-effort; when in doubt
+  the content is preserved as prose rather than forced into a grid (no text is dropped).
+
+For GitHub-Flavored Markdown export, merged-cell values are repeated across every column
+they cover, and multi-level headers are flattened into a single header row joining the
+levels with " › ".
