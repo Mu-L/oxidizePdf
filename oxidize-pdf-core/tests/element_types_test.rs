@@ -35,18 +35,17 @@ fn test_element_paragraph_creation() {
 fn test_element_table_creation() {
     use oxidize_pdf::pipeline::TableElementData;
 
-    let table = Element::Table(TableElementData {
-        rows: vec![
+    let table = Element::Table(TableElementData::new(
+        vec![
             vec!["A".to_string(), "B".to_string(), "C".to_string()],
             vec!["1".to_string(), "2".to_string(), "3".to_string()],
             vec!["X".to_string(), "Y".to_string(), "Z".to_string()],
         ],
-        structure: None,
-        metadata: ElementMetadata {
+        ElementMetadata {
             page: 1,
             ..Default::default()
         },
-    });
+    ));
 
     assert!(matches!(table, Element::Table(_)));
     assert_eq!(table.row_count(), Some(3));
@@ -66,11 +65,7 @@ fn test_element_variants_exhaustive() {
     let elements = vec![
         Element::Title(data()),
         Element::Paragraph(data()),
-        Element::Table(TableElementData {
-            rows: vec![],
-            structure: None,
-            metadata: ElementMetadata::default(),
-        }),
+        Element::Table(TableElementData::new(vec![], ElementMetadata::default())),
         Element::Header(data()),
         Element::Footer(data()),
         Element::ListItem(data()),
@@ -207,14 +202,13 @@ fn test_element_sort_by_reading_order() {
 fn test_element_display_text_table() {
     use oxidize_pdf::pipeline::TableElementData;
 
-    let table = Element::Table(TableElementData {
-        rows: vec![
+    let table = Element::Table(TableElementData::new(
+        vec![
             vec!["Name".to_string(), "Age".to_string()],
             vec!["Alice".to_string(), "30".to_string()],
         ],
-        structure: None,
-        metadata: ElementMetadata::default(),
-    });
+        ElementMetadata::default(),
+    ));
 
     let display = table.display_text();
     assert!(display.contains("Name"));

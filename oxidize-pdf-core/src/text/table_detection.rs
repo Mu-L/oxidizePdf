@@ -96,6 +96,7 @@ impl Default for TableDetectionConfig {
 
 /// A detected table with cells, rows, and columns.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DetectedTable {
     /// Bounding box of the entire table
     pub bbox: BoundingBox,
@@ -165,6 +166,7 @@ impl DetectedTable {
 
 /// A single cell in a detected table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableCell {
     /// Row index (0-based)
     pub row: usize,

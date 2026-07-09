@@ -63,19 +63,18 @@ fn test_semantic_chunk_title_not_split() {
 fn test_semantic_chunk_table_stays_whole() {
     let elements = vec![
         para("Before table.", 0, 750.0),
-        Element::Table(TableElementData {
-            rows: vec![
+        Element::Table(TableElementData::new(
+            vec![
                 vec!["A".into(), "B".into()],
                 vec!["1".into(), "2".into()],
                 vec!["3".into(), "4".into()],
             ],
-            structure: None,
-            metadata: ElementMetadata {
+            ElementMetadata {
                 page: 0,
                 bbox: ElementBBox::new(50.0, 600.0, 400.0, 100.0),
                 ..Default::default()
             },
-        }),
+        )),
         para("After table.", 0, 450.0),
     ];
 
@@ -92,17 +91,16 @@ fn test_semantic_chunk_table_stays_whole() {
 
 #[test]
 fn test_semantic_chunk_large_table_allowed_to_overflow() {
-    let big_table = Element::Table(TableElementData {
-        rows: (0..50)
+    let big_table = Element::Table(TableElementData::new(
+        (0..50)
             .map(|i| vec![format!("cell_{}_0", i), format!("cell_{}_1", i)])
             .collect(),
-        structure: None,
-        metadata: ElementMetadata {
+        ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 100.0, 400.0, 500.0),
             ..Default::default()
         },
-    });
+    ));
 
     let chunks =
         SemanticChunker::new(SemanticChunkConfig::new(20).with_overlap(0)).chunk(&[big_table]);

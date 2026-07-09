@@ -242,6 +242,7 @@ pub struct TableStructure {
 /// Data specific to table elements.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "semantic", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub struct TableElementData {
     /// Row-major flat cell data. Each inner Vec is one row. When `structure` is
     /// present this is its expanded (span-repeated) view; otherwise it is the
@@ -253,6 +254,16 @@ pub struct TableElementData {
 }
 
 impl TableElementData {
+    /// Build a plain (non-rich) table from flat row-major cells. `structure` is
+    /// `None`; use `from_structure` when merged cells / header rows are known.
+    pub fn new(rows: Vec<Vec<String>>, metadata: ElementMetadata) -> Self {
+        Self {
+            rows,
+            structure: None,
+            metadata,
+        }
+    }
+
     /// Build from rich structure, deriving the flat `rows` view by expanding each
     /// spanning cell's text across every covered (row, col).
     pub fn from_structure(structure: TableStructure, metadata: ElementMetadata) -> Self {

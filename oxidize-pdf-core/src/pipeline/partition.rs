@@ -430,16 +430,15 @@ impl Partitioner {
                                 table.bounding_box.height,
                             );
 
-                            elements.push(Element::Table(TableElementData {
+                            elements.push(Element::Table(TableElementData::new(
                                 rows,
-                                structure: None,
-                                metadata: ElementMetadata {
+                                ElementMetadata {
                                     page,
                                     bbox,
                                     confidence: table.confidence,
                                     ..Default::default()
                                 },
-                            }));
+                            )));
 
                             // #375: claim only fragments inside a populated cell.
                             for (i, f) in fragments.iter().enumerate() {

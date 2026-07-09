@@ -210,13 +210,12 @@ fn test_kv_confidence_minimum_is_0_5() {
 // Cycle 2.5
 #[test]
 fn test_table_element_confidence_is_not_overridden() {
-    let table = Element::Table(TableElementData {
-        rows: vec![vec!["A".to_string(), "B".to_string()]],
-        structure: None,
-        metadata: ElementMetadata {
+    let table = Element::Table(TableElementData::new(
+        vec![vec!["A".to_string(), "B".to_string()]],
+        ElementMetadata {
             confidence: 0.7,
             ..Default::default()
         },
-    });
+    ));
     assert!((table.metadata().confidence - 0.7).abs() < f64::EPSILON);
 }

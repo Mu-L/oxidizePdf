@@ -412,11 +412,10 @@ mod tests {
     use crate::pipeline::element::{Element, ElementData, ElementMetadata, TableStructure};
 
     fn table_el() -> Element {
-        Element::Table(crate::pipeline::element::TableElementData {
-            rows: vec![],
-            structure: None,
-            metadata: crate::pipeline::element::ElementMetadata::default(),
-        })
+        Element::Table(crate::pipeline::element::TableElementData::new(
+            vec![],
+            crate::pipeline::element::ElementMetadata::default(),
+        ))
     }
 
     #[test]
@@ -630,14 +629,12 @@ mod tests {
     }
 
     fn table_with(rows: Vec<Vec<&str>>) -> Element {
-        Element::Table(crate::pipeline::element::TableElementData {
-            rows: rows
-                .into_iter()
+        Element::Table(crate::pipeline::element::TableElementData::new(
+            rows.into_iter()
                 .map(|r| r.into_iter().map(String::from).collect())
                 .collect(),
-            structure: None,
-            metadata: ElementMetadata::default(),
-        })
+            ElementMetadata::default(),
+        ))
     }
 
     #[test]
@@ -673,6 +670,12 @@ mod tests {
         // Flat `rows` says 1x1; rich `structure` says 3x4 (e.g. a merged-cell
         // table where the flat fallback under-counts). table_dims must read
         // the structure geometry, not the flat rows, when structure is present.
+        // Deliberately construct rows/structure out of sync (1x1 flat rows vs
+        // 3x4 structure) to prove table_dims reads structure geometry, not the
+        // flat rows view. `from_structure` would derive rows FROM structure and
+        // erase this mismatch, so this stays a same-crate struct literal
+        // (unaffected by #[non_exhaustive], which only gates cross-crate
+        // construction).
         let el = Element::Table(crate::pipeline::element::TableElementData {
             rows: vec![vec!["x".to_string()]],
             structure: Some(TableStructure {

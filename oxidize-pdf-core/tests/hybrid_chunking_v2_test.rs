@@ -38,19 +38,18 @@ fn title_elem(text: &str, page: u32, y: f64) -> Element {
 }
 
 fn make_small_table() -> Element {
-    Element::Table(TableElementData {
-        rows: vec![
+    Element::Table(TableElementData::new(
+        vec![
             vec!["Header A".to_string(), "Header B".to_string()],
             vec!["Row 1A".to_string(), "Row 1B".to_string()],
             vec!["Row 2A".to_string(), "Row 2B".to_string()],
         ],
-        structure: None,
-        metadata: ElementMetadata {
+        ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 400.0, 400.0, 100.0),
             ..Default::default()
         },
-    })
+    ))
 }
 
 fn frag(text: &str, x: f64, y: f64, font_size: f64) -> TextFragment {
@@ -227,15 +226,14 @@ fn test_table_oversized_remains_atomic_not_split() {
     let big_rows: Vec<Vec<String>> = (0..100)
         .map(|i| vec![format!("key_{}", i), format!("value_{}", i)])
         .collect();
-    let elements = vec![Element::Table(TableElementData {
-        rows: big_rows,
-        structure: None,
-        metadata: ElementMetadata {
+    let elements = vec![Element::Table(TableElementData::new(
+        big_rows,
+        ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 300.0, 400.0, 400.0),
             ..Default::default()
         },
-    })];
+    ))];
     let chunker = HybridChunker::new(HybridChunkConfig {
         max_tokens: 20,
         overlap_tokens: 0,

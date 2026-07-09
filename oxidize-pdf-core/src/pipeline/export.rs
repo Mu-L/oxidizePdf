@@ -184,14 +184,13 @@ mod tests {
     #[test]
     fn no_structure_table_unchanged() {
         let metadata = ElementMetadata::default();
-        let data = TableElementData {
-            rows: vec![
+        let data = TableElementData::new(
+            vec![
                 vec!["a".to_string(), "b".to_string()],
                 vec!["1".to_string(), "2".to_string()],
             ],
-            structure: None,
             metadata,
-        };
+        );
         let expected = table_to_markdown(&data.rows);
         assert_eq!(table_to_markdown_data(&data), expected);
         assert_eq!(expected, "| a | b |\n| --- | --- |\n| 1 | 2 |");
