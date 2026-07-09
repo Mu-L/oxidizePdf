@@ -45,6 +45,7 @@
 
 use crate::graphics::extraction::{ExtractedGraphics, LineOrientation, VectorLine};
 use crate::text::extraction::TextFragment;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Errors that can occur during table detection.
@@ -326,6 +327,10 @@ impl TableDetector {
         // Calculate cell boundaries
         let cells = self.create_cells_from_grid(&grid);
 
+        // Merge base cells across absent interior dividers before text assignment
+        // so text lands in the merged (spanning) cells (issue #375).
+        let cells = self.merge_cells_across_absent_dividers(&grid, cells);
+
         // Assign text to cells
         let cells_with_text = self.assign_text_to_cells(cells, text_fragments);
 
@@ -361,7 +366,23 @@ impl TableDetector {
         // Reverse rows so row 0 is at the top (highest Y) for intuitive indexing
         rows.reverse();
 
-        Ok(GridPattern { rows, columns })
+        // Retain the raw divider segments (normalized) so absent interior
+        // dividers can be detected for merged-cell reconstruction (issue #375).
+        let h_segments: Vec<(f64, f64, f64)> = h_lines
+            .iter()
+            .map(|line| (line.y1, line.x1.min(line.x2), line.x1.max(line.x2)))
+            .collect();
+        let v_segments: Vec<(f64, f64, f64)> = v_lines
+            .iter()
+            .map(|line| (line.x1, line.y1.min(line.y2), line.y1.max(line.y2)))
+            .collect();
+
+        Ok(GridPattern {
+            rows,
+            columns,
+            h_segments,
+            v_segments,
+        })
     }
 
     /// Clusters lines by their primary position (Y for horizontal, X for vertical).
@@ -453,6 +474,116 @@ impl TableDetector {
         cells
     }
 
+    /// Returns true if a vertical divider is drawn at `x` covering the Y-range
+    /// `[y0, y1]` (within `alignment_tolerance`) — i.e. some retained vertical
+    /// segment sits at that column and spans the given row band (issue #375).
+    fn divider_present_vertical(&self, grid: &GridPattern, x: f64, y0: f64, y1: f64) -> bool {
+        let tol = self.config.alignment_tolerance;
+        let (lo, hi) = (y0.min(y1), y0.max(y1));
+        grid.v_segments
+            .iter()
+            .any(|&(sx, s0, s1)| (sx - x).abs() <= tol && s0 <= lo + tol && s1 >= hi - tol)
+    }
+
+    /// Returns true if a horizontal divider is drawn at `y` covering the
+    /// X-range `[x0, x1]` (within `alignment_tolerance`) (issue #375).
+    fn divider_present_horizontal(&self, grid: &GridPattern, y: f64, x0: f64, x1: f64) -> bool {
+        let tol = self.config.alignment_tolerance;
+        let (lo, hi) = (x0.min(x1), x0.max(x1));
+        grid.h_segments
+            .iter()
+            .any(|&(sy, s0, s1)| (sy - y).abs() <= tol && s0 <= lo + tol && s1 >= hi - tol)
+    }
+
+    /// Merges base cells across *absent* interior dividers into spanning cells.
+    ///
+    /// Two adjacent base cells belong to the same merged region when the divider
+    /// on their shared edge is not drawn. Union-find groups connected base cells;
+    /// each region becomes one [`TableCell`] positioned at its top-left base
+    /// index with `row_span`/`col_span` equal to its extent (issue #375).
+    ///
+    /// A fully-ruled table (every divider present) yields all-`1` spans, i.e.
+    /// output identical to the base grid.
+    fn merge_cells_across_absent_dividers(
+        &self,
+        grid: &GridPattern,
+        cells: Vec<TableCell>,
+    ) -> Vec<TableCell> {
+        let num_rows = grid.rows.len().saturating_sub(1);
+        let num_cols = grid.columns.len().saturating_sub(1);
+        if num_rows == 0 || num_cols == 0 {
+            return cells;
+        }
+
+        // Union-find over base cells (flat index = r * num_cols + c).
+        fn find(parent: &mut [usize], i: usize) -> usize {
+            if parent[i] != i {
+                let root = find(parent, parent[i]);
+                parent[i] = root;
+            }
+            parent[i]
+        }
+
+        let mut parent: Vec<usize> = (0..num_rows * num_cols).collect();
+        for r in 0..num_rows {
+            for c in 0..num_cols {
+                // Merge right across an absent vertical divider at columns[c+1].
+                if c + 1 < num_cols {
+                    let x = grid.columns[c + 1];
+                    if !self.divider_present_vertical(grid, x, grid.rows[r], grid.rows[r + 1]) {
+                        let a = find(&mut parent, r * num_cols + c);
+                        let b = find(&mut parent, r * num_cols + c + 1);
+                        parent[a] = b;
+                    }
+                }
+                // Merge down across an absent horizontal divider at rows[r+1].
+                if r + 1 < num_rows {
+                    let y = grid.rows[r + 1];
+                    if !self.divider_present_horizontal(
+                        grid,
+                        y,
+                        grid.columns[c],
+                        grid.columns[c + 1],
+                    ) {
+                        let a = find(&mut parent, r * num_cols + c);
+                        let b = find(&mut parent, (r + 1) * num_cols + c);
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+
+        // Group base cells by root. BTreeMap keeps the output deterministic.
+        let mut groups: BTreeMap<usize, Vec<&TableCell>> = BTreeMap::new();
+        for cell in &cells {
+            let root = find(&mut parent, cell.row * num_cols + cell.column);
+            groups.entry(root).or_default().push(cell);
+        }
+
+        let mut merged = Vec::with_capacity(groups.len());
+        for group in groups.into_values() {
+            let min_r = group.iter().map(|c| c.row).min().unwrap_or(0);
+            let min_c = group.iter().map(|c| c.column).min().unwrap_or(0);
+            let max_r = group.iter().map(|c| c.row).max().unwrap_or(0);
+            let max_c = group.iter().map(|c| c.column).max().unwrap_or(0);
+
+            // Merged bbox spans the grid extents of the region (deterministic).
+            let x = grid.columns[min_c];
+            let y = grid.rows[min_r].min(grid.rows[max_r + 1]);
+            let w = (grid.columns[max_c + 1] - grid.columns[min_c]).abs();
+            let h = (grid.rows[max_r + 1] - grid.rows[min_r]).abs();
+
+            let mut cell = TableCell::new(min_r, min_c, BoundingBox::new(x, y, w, h));
+            cell.has_borders = true;
+            cell.row_span = max_r - min_r + 1;
+            cell.col_span = max_c - min_c + 1;
+            merged.push(cell);
+        }
+
+        merged.sort_by_key(|c| (c.row, c.column));
+        merged
+    }
+
     /// Assigns text fragments to cells based on spatial containment.
     ///
     /// **Coordinate Space Normalization**:
@@ -525,6 +656,13 @@ struct GridPattern {
     rows: Vec<f64>,
     /// Column X coordinates (sorted)
     columns: Vec<f64>,
+    /// Raw horizontal divider segments as `(y, x_start, x_end)` with
+    /// `x_start <= x_end`. Retained so absent interior dividers (merged cells)
+    /// can be detected instead of assuming a fully dense grid (issue #375).
+    h_segments: Vec<(f64, f64, f64)>,
+    /// Raw vertical divider segments as `(x, y_start, y_end)` with
+    /// `y_start <= y_end` (issue #375).
+    v_segments: Vec<(f64, f64, f64)>,
 }
 
 impl Default for TableDetector {
