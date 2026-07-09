@@ -324,6 +324,14 @@ impl Partitioner {
                                 if table.confidence < self.config.min_table_confidence {
                                     continue;
                                 }
+                                // #375: a table that captured too few cells is not a
+                                // table — skip it so its fragments become prose.
+                                let populated =
+                                    table.cells.iter().filter(|c| !c.text.is_empty()).count();
+                                if populated < table.rows.max(1) {
+                                    // fewer populated cells than rows => no real column structure
+                                    continue;
+                                }
                                 let rows = ruling_table_to_rows(table);
                                 let bbox = ElementBBox::new(
                                     table.bbox.x,
@@ -395,6 +403,18 @@ impl Partitioner {
                         for table in &result.tables {
                             // Apply minimum confidence filter.
                             if table.confidence < self.config.min_table_confidence {
+                                continue;
+                            }
+
+                            // #375: a table that captured too few cells is not a
+                            // table — skip it so its fragments become prose.
+                            let populated = table
+                                .rows
+                                .iter()
+                                .flat_map(|r| &r.cells)
+                                .filter(|c| !c.is_empty())
+                                .count();
+                            if populated < table.row_count().max(1) {
                                 continue;
                             }
 
