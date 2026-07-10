@@ -105,6 +105,7 @@ fn rag_chunks_with_counter_word_proxy_parity() {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
 
     let base = doc.rag_chunks_with(config.clone()).unwrap();

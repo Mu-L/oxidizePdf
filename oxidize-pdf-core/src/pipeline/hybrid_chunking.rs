@@ -46,6 +46,7 @@ pub enum MergePolicy {
 ///     merge_adjacent: true,
 ///     propagate_headings: true,
 ///     merge_policy: MergePolicy::AnyInlineContent,
+///     ..Default::default()
 /// };
 /// assert_eq!(config.max_tokens, 256);
 /// ```
@@ -69,6 +70,11 @@ pub struct HybridChunkConfig {
     pub propagate_headings: bool,
     /// Merge policy for adjacent elements. Default: `MergePolicy::AnyInlineContent`.
     pub merge_policy: MergePolicy,
+    /// How each chunk's `full_text` is contextualized for RAG embedding
+    /// (issue #376). Default [`ContextMode::Heading`] — byte-identical to the
+    /// pre-#376 behavior. Set [`ContextMode::Contextual`] for deterministic,
+    /// no-ML document+section context prefixes.
+    pub context_mode: ContextMode,
 }
 
 impl Default for HybridChunkConfig {
@@ -79,8 +85,40 @@ impl Default for HybridChunkConfig {
             merge_adjacent: true,
             propagate_headings: true,
             merge_policy: MergePolicy::AnyInlineContent,
+            context_mode: ContextMode::Heading,
         }
     }
+}
+
+/// How each chunk's `full_text` (the text used for RAG embedding) is
+/// contextualized (issue #376). Contextualization is deterministic and no-ML —
+/// the no-ML analogue of Contextual Retrieval / Late Chunking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextMode {
+    /// No context prefix — `full_text == text`.
+    None,
+    /// Prepend only the leaf heading context (the pre-#376 behavior, and the
+    /// default so existing callers see byte-identical output).
+    #[default]
+    Heading,
+    /// Prepend a deterministic document + section context snippet in the given
+    /// [`ContextFormat`], situating the chunk in its document (title/author or
+    /// filename, full heading breadcrumb, optional page span).
+    Contextual(ContextFormat),
+}
+
+/// Deterministic, no-ML context-prefix format for [`ContextMode::Contextual`].
+///
+/// `#[non_exhaustive]` so future formats (e.g. structured JSON/YAML) can be
+/// added without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContextFormat {
+    /// Labeled lines, e.g. `Document: <title> — <author>` / `Section: <breadcrumb> (p. N–M)`.
+    Labeled,
+    /// A single natural-language sentence, e.g.
+    /// `This chunk is from "<title>" by <author>, section "<breadcrumb>" (p. N–M).`
+    Prose,
 }
 
 /// A hybrid chunk: a group of elements with heading context.

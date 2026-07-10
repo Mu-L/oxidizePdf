@@ -57,6 +57,7 @@ fn test_heading_context_propagated_to_chunks() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -79,6 +80,7 @@ fn test_no_heading_before_first_title() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -103,6 +105,7 @@ fn test_heading_context_changes_on_new_title() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -133,6 +136,7 @@ fn test_merge_adjacent_paragraphs_within_budget() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -157,6 +161,7 @@ fn test_no_merge_different_element_types() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -185,6 +190,7 @@ fn test_merge_disabled_one_chunk_per_element() {
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     assert_eq!(chunker.chunk(&elements).len(), 3);
 }
@@ -215,6 +221,7 @@ fn test_oversized_table_gets_own_oversized_chunk() {
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -249,6 +256,7 @@ fn test_overlap_chunks_preserve_heading_context() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -332,6 +340,7 @@ fn test_list_items_merge_with_list_items_not_paragraphs() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 

@@ -135,7 +135,7 @@ pub trait MetadataEnricher: Send + Sync {
     fn enrich(&self, ctx: &EnrichContext, meta: &mut crate::pipeline::ChunkMetadata);
 }
 
-use crate::pipeline::hybrid_chunking::{HybridChunkConfig, HybridChunker};
+use crate::pipeline::hybrid_chunking::{ContextMode, HybridChunkConfig, HybridChunker};
 use crate::pipeline::{DocumentSource, PartitionConfig};
 
 /// Configures the analysis pipeline: which chunking strategy to run, the token
@@ -149,6 +149,12 @@ pub struct AnalysisPipeline {
     pub(crate) source: Option<DocumentSource>,
     pub(crate) classifier: Option<Box<dyn ElementClassifier>>,
     pub(crate) partition_config: PartitionConfig,
+    /// How each chunk's `full_text` is contextualized (issue #376). Carried on
+    /// the pipeline because the chunking `Box<dyn ChunkingStrategy>` produces
+    /// `ChunkGroup`s and cannot expose a `HybridChunkConfig` to read the mode
+    /// back from — so a custom strategy's `context_mode` would otherwise be
+    /// lost. Defaults to [`ContextMode::Heading`].
+    pub(crate) context_mode: ContextMode,
     #[cfg(feature = "semantic")]
     pub(crate) enrichers: Vec<Box<dyn MetadataEnricher>>,
 }
@@ -166,6 +172,7 @@ impl AnalysisPipeline {
         let config = HybridChunkConfig::default();
         Self {
             max_tokens: config.max_tokens,
+            context_mode: config.context_mode,
             chunking: Box::new(HybridChunker::new(config)),
             source: None,
             classifier: None,
@@ -173,6 +180,20 @@ impl AnalysisPipeline {
             #[cfg(feature = "semantic")]
             enrichers: Vec::new(),
         }
+    }
+
+    /// Set how each chunk's `full_text` is contextualized (issue #376).
+    ///
+    /// Needed on the pipeline because a custom chunking strategy (`Box<dyn
+    /// ChunkingStrategy>`) yields `ChunkGroup`s and carries no
+    /// `HybridChunkConfig`, so a `context_mode` set on a `HybridChunker` wired
+    /// via [`with_chunking`](Self::with_chunking) cannot be read back — set it
+    /// here instead. When the strategy *is* the built-in `HybridChunker`, this
+    /// takes precedence over any `context_mode` on its config.
+    #[must_use]
+    pub fn with_context_mode(mut self, context_mode: ContextMode) -> Self {
+        self.context_mode = context_mode;
+        self
     }
 
     /// Replace the chunking strategy.

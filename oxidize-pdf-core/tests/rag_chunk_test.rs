@@ -69,6 +69,7 @@ fn test_rag_chunk_from_hybrid_chunk() {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let hybrid_chunks = chunker.chunk(&elements);
     assert_eq!(hybrid_chunks.len(), 1);
@@ -103,6 +104,7 @@ fn test_rag_chunk_collects_pages_from_multi_page_elements() {
         merge_adjacent: true,
         merge_policy: MergePolicy::AnyInlineContent,
         propagate_headings: false,
+        context_mode: Default::default(),
     });
     let hybrid_chunks = chunker.chunk(&elements);
     let rag = RagChunk::from_hybrid_chunk(0, &hybrid_chunks[0]);
@@ -181,6 +183,7 @@ fn test_rag_chunks_indices_are_sequential() {
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let hybrid_chunks = chunker.chunk(&elements);
     let rag_chunks: Vec<RagChunk> = hybrid_chunks
@@ -216,6 +219,7 @@ fn test_rag_chunks_with_custom_config_produces_more_chunks() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
     let large_config = HybridChunkConfig {
         max_tokens: 512,
@@ -223,6 +227,7 @@ fn test_rag_chunks_with_custom_config_produces_more_chunks() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
 
     let small_chunks: Vec<RagChunk> = HybridChunker::new(small_config)
@@ -275,6 +280,7 @@ fn test_rag_chunks_json_serializes_vec_as_array() {
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
 
     let rag_chunks: Vec<RagChunk> = chunker
@@ -305,6 +311,7 @@ fn test_rag_chunk_page_numbers_are_sorted() {
         merge_adjacent: true,
         merge_policy: MergePolicy::AnyInlineContent,
         propagate_headings: false,
+        context_mode: Default::default(),
     });
     let hybrid_chunks = chunker.chunk(&elements);
     let rag = RagChunk::from_hybrid_chunk(0, &hybrid_chunks[0]);
@@ -329,6 +336,7 @@ fn test_element_type_names_for_all_variants() {
             merge_adjacent: false,
             propagate_headings: false,
             merge_policy: MergePolicy::AnyInlineContent,
+            context_mode: Default::default(),
         });
         let chunks = chunker.chunk(&[element]);
         RagChunk::from_hybrid_chunk(0, &chunks[0])

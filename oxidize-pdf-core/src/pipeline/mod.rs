@@ -21,7 +21,9 @@ pub use element::{
 };
 pub use export::{ElementMarkdownExporter, ExportConfig};
 pub use graph::ElementGraph;
-pub use hybrid_chunking::{HybridChunk, HybridChunkConfig, HybridChunker, MergePolicy};
+pub use hybrid_chunking::{
+    ContextFormat, ContextMode, HybridChunk, HybridChunkConfig, HybridChunker, MergePolicy,
+};
 pub use partition::{PartitionConfig, Partitioner, ReadingOrderStrategy};
 pub use profile::{ExtractionProfile, ProfileConfig};
 pub use rag::RagChunk;
