@@ -76,6 +76,30 @@ pub struct ExtractionOptions {
     /// the layout path's reconstruction, not stream order); `.fragments` stays
     /// empty.
     pub reorder_columns: bool,
+    /// Stop accumulating decoded text for a page once this many bytes have been
+    /// collected, bounding the per-page peak memory of extraction. The limit is
+    /// enforced *during* accumulation, not by truncating the finished string, so
+    /// a single page with a huge or adversarially inflated content stream cannot
+    /// materialise an unbounded `String` before the caller sees it (issue #382).
+    ///
+    /// Semantics are *undershoot*: extraction stops before the fragment that
+    /// would push the accumulated bytes past the limit, so the returned
+    /// `text.len() <= max_extracted_bytes` and a multi-byte UTF-8 character is
+    /// never split. When the limit cuts extraction short,
+    /// [`ExtractedText::truncated`] is set to `true`.
+    ///
+    /// `None` (default) means no limit — output is byte-identical to before.
+    /// The `text.len() <= max_extracted_bytes` invariant holds on **every** path
+    /// (flat, `reorder_columns`, `preserve_layout`): the layout paths rebuild
+    /// `.text` from the already-bounded fragment set and are then clamped to the
+    /// limit at a UTF-8 char boundary as a final safety net.
+    ///
+    /// Because whole decoded runs are the unit of truncation, a page whose text
+    /// is a single run larger than the whole budget (e.g. one huge `Tj`, or an
+    /// `/ActualText` override) comes back with `text == ""` and
+    /// `truncated == true` rather than a partial run — the limit is never
+    /// satisfied by splitting a run mid-character.
+    pub max_extracted_bytes: Option<usize>,
 }
 
 impl Default for ExtractionOptions {
@@ -93,17 +117,44 @@ impl Default for ExtractionOptions {
             reconstruct_paragraphs: false,
             include_artifacts: false,
             reorder_columns: false,
+            max_extracted_bytes: None,
         }
     }
 }
 
-/// Extracted text with position information
+/// Extracted text with position information.
+///
+/// Pipeline output: returned by the `extract_text*` entry points on
+/// [`Page`](crate::page::Page) / [`PdfDocument`](crate::parser::PdfDocument).
+/// `#[non_exhaustive]` so future fields (e.g. per-run diagnostics) can be added
+/// without a breaking change — construct one outside the crate via
+/// [`ExtractedText::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExtractedText {
     /// The extracted text content
     pub text: String,
     /// Text fragments with position information (if preserve_layout is true)
     pub fragments: Vec<TextFragment>,
+    /// `true` when extraction stopped early because
+    /// [`ExtractionOptions::max_extracted_bytes`] was reached, so `text` is a
+    /// bounded prefix of the page's full text rather than the whole page
+    /// (issue #382). Always `false` when no limit is set.
+    pub truncated: bool,
+}
+
+impl ExtractedText {
+    /// Build an `ExtractedText` from its text and fragments, with `truncated`
+    /// set to `false`. Provided because `ExtractedText` is `#[non_exhaustive]`,
+    /// so external callers cannot use a struct literal. Set [`truncated`](Self::truncated)
+    /// afterwards if you are synthesizing a bounded result.
+    pub fn new(text: String, fragments: Vec<TextFragment>) -> Self {
+        Self {
+            text,
+            fragments,
+            truncated: false,
+        }
+    }
 }
 
 /// Metadata about a space insertion decision during text extraction.
@@ -275,6 +326,10 @@ struct OpRunState {
     last_y: f64,
     extracted_text: String,
     fragments: Vec<TextFragment>,
+    /// Set once the per-page byte budget (`max_extracted_bytes`) has cut text
+    /// accumulation short. Propagates through Form XObject recursion and into
+    /// [`ExtractedText::truncated`] (issue #382).
+    truncated: bool,
 }
 
 impl Default for TextState {
@@ -707,6 +762,7 @@ impl TextExtractor {
             last_y,
             extracted_text,
             fragments,
+            truncated: false,
         };
 
         // Process each content stream
@@ -749,11 +805,18 @@ impl TextExtractor {
                 page_index,
                 0,
             )?;
+
+            // Per-page byte budget reached (issue #382): don't decode the
+            // remaining content streams — the text is already at the limit.
+            if run.truncated {
+                break;
+            }
         }
 
         let OpRunState {
             mut extracted_text,
             mut fragments,
+            mut truncated,
             ..
         } = run;
         {
@@ -805,11 +868,22 @@ impl TextExtractor {
                 extracted_text = self.reconstruct_text_from_fragments(&fragments);
                 fragments.clear();
             }
+
+            // Final safety net (issue #382): the layout/reorder reconstruction
+            // above rebuilds `.text` with its own separators, so guarantee the
+            // `text.len() <= max_extracted_bytes` invariant for every path here.
+            // No-op for the flat path (already bounded) and when no limit is set.
+            clamp_to_budget(
+                &mut extracted_text,
+                self.options.max_extracted_bytes,
+                &mut truncated,
+            );
         }
 
         Ok(ExtractedText {
             text: extracted_text,
             fragments,
+            truncated,
         })
     }
 
@@ -832,6 +906,7 @@ impl TextExtractor {
             mut last_y,
             mut extracted_text,
             mut fragments,
+            mut truncated,
         } = run;
 
         let page_properties: Option<&crate::parser::objects::PdfDictionary> =
@@ -842,6 +917,12 @@ impl TextExtractor {
 
         let _ops_span = tracing::info_span!("text_ops_loop").entered();
         for op in operations {
+            // Per-page byte budget reached (issue #382): stop processing further
+            // operators. Show-text arms also `break` mid-run, but a state-only
+            // op between two show ops would otherwise keep the loop alive.
+            if truncated {
+                break;
+            }
             match op {
                 ContentOperation::BeginText => {
                     in_text_object = true;
@@ -896,26 +977,42 @@ impl TextExtractor {
                         let skip_text = skip_artifact_text(&state, self.options.include_artifacts);
 
                         // Add spacing based on position change
-                        if !skip_text && !extracted_text.is_empty() {
-                            let dx = x - last_x;
-                            let dy = (y - last_y).abs();
-
-                            // A large backward jump in x is a line wrap: the pen
-                            // returns to the left margin on a new line. When the
-                            // line height is below `newline_threshold` the dy check
-                            // alone misses it, so treat a backward dx beyond one
-                            // line-height (2× the threshold, conservative) as a
-                            // newline regardless of dy (issue #390).
-                            let line_wrap = dx < -(self.options.newline_threshold * 2.0);
-                            if dy > self.options.newline_threshold || line_wrap {
-                                extracted_text.push('\n');
-                            } else if dx > self.options.space_threshold * state.font_size {
-                                extracted_text.push(' ');
-                            }
-                        }
-
                         if !skip_text {
-                            extracted_text.push_str(&decoded);
+                            let separator = if !extracted_text.is_empty() {
+                                let dx = x - last_x;
+                                let dy = (y - last_y).abs();
+
+                                // A large backward jump in x is a line wrap: the
+                                // pen returns to the left margin on a new line.
+                                // When the line height is below `newline_threshold`
+                                // the dy check alone misses it, so treat a backward
+                                // dx beyond one line-height (2× the threshold,
+                                // conservative) as a newline regardless of dy
+                                // (issue #390).
+                                let line_wrap = dx < -(self.options.newline_threshold * 2.0);
+                                if dy > self.options.newline_threshold || line_wrap {
+                                    Some('\n')
+                                } else if dx > self.options.space_threshold * state.font_size {
+                                    Some(' ')
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            // Per-page byte budget (issue #382): stop before the
+                            // run that would overshoot; the outer loop guard ends
+                            // extraction on the next iteration.
+                            if !append_bounded(
+                                &mut extracted_text,
+                                separator,
+                                &decoded,
+                                self.options.max_extracted_bytes,
+                                &mut truncated,
+                            ) {
+                                break;
+                            }
                         }
 
                         // Get font info for accurate width calculation.
@@ -985,16 +1082,26 @@ impl TextExtractor {
                                     // kern, so it is safe to break there.
                                     let line_wrap =
                                         (x - last_x) < -(self.options.newline_threshold * 2.0);
-                                    if !skip_text
-                                        && !extracted_text.is_empty()
-                                        && ((y - last_y).abs() > self.options.newline_threshold
-                                            || line_wrap)
-                                    {
-                                        extracted_text.push('\n');
-                                    }
-
                                     if !skip_text {
-                                        extracted_text.push_str(&decoded);
+                                        let separator = if !extracted_text.is_empty()
+                                            && ((y - last_y).abs() > self.options.newline_threshold
+                                                || line_wrap)
+                                        {
+                                            Some('\n')
+                                        } else {
+                                            None
+                                        };
+
+                                        // Per-page byte budget (issue #382).
+                                        if !append_bounded(
+                                            &mut extracted_text,
+                                            separator,
+                                            &decoded,
+                                            self.options.max_extracted_bytes,
+                                            &mut truncated,
+                                        ) {
+                                            break;
+                                        }
                                     }
 
                                     let text_width = {
@@ -1046,7 +1153,18 @@ impl TextExtractor {
                                         && !extracted_text.is_empty()
                                         && !extracted_text.ends_with(' ')
                                     {
-                                        extracted_text.push(' ');
+                                        // Per-page byte budget (issue #382): even
+                                        // the synthesised space counts, so the
+                                        // `text.len() <= limit` invariant holds.
+                                        if !append_bounded(
+                                            &mut extracted_text,
+                                            Some(' '),
+                                            "",
+                                            self.options.max_extracted_bytes,
+                                            &mut truncated,
+                                        ) {
+                                            break;
+                                        }
 
                                         // Skip the fragment-level emission while an
                                         // ActualText scope is pending: the synthesised
@@ -1106,10 +1224,21 @@ impl TextExtractor {
                         // Mirror the artifact gate (issue #330).
                         let skip_text = skip_artifact_text(&state, self.options.include_artifacts);
                         if !skip_text {
-                            if !extracted_text.is_empty() {
-                                extracted_text.push('\n');
+                            let separator = if extracted_text.is_empty() {
+                                None
+                            } else {
+                                Some('\n')
+                            };
+                            // Per-page byte budget (issue #382).
+                            if !append_bounded(
+                                &mut extracted_text,
+                                separator,
+                                &decoded,
+                                self.options.max_extracted_bytes,
+                                &mut truncated,
+                            ) {
+                                break;
                             }
-                            extracted_text.push_str(&decoded);
                         }
 
                         let text_width = {
@@ -1163,10 +1292,21 @@ impl TextExtractor {
                         // Mirror the artifact gate (issue #330).
                         let skip_text = skip_artifact_text(&state, self.options.include_artifacts);
                         if !skip_text {
-                            if !extracted_text.is_empty() {
-                                extracted_text.push('\n');
+                            let separator = if extracted_text.is_empty() {
+                                None
+                            } else {
+                                Some('\n')
+                            };
+                            // Per-page byte budget (issue #382).
+                            if !append_bounded(
+                                &mut extracted_text,
+                                separator,
+                                &decoded,
+                                self.options.max_extracted_bytes,
+                                &mut truncated,
+                            ) {
+                                break;
                             }
-                            extracted_text.push_str(&decoded);
                         }
 
                         let text_width = {
@@ -1341,6 +1481,25 @@ impl TextExtractor {
                                 let (mcid, struct_tag) = innermost_mc_tag(&state.mc_stack);
                                 let in_artifact = state.mc_stack.iter().any(|e| e.is_artifact);
                                 if !in_artifact || self.options.include_artifacts {
+                                    // Per-page byte budget (issue #382): the
+                                    // `/ActualText` override is this scope's
+                                    // canonical text and can be arbitrarily
+                                    // large. It bypasses the per-`Tj`
+                                    // `append_bounded` gate, so account it here
+                                    // against the same ledger (`extracted_text`,
+                                    // which these paths rebuild from `fragments`).
+                                    // If it would overshoot, drop the fragment and
+                                    // stop — a huge override must not escape the
+                                    // cap while reporting `truncated = false`.
+                                    if !append_bounded(
+                                        &mut extracted_text,
+                                        None,
+                                        &run.text,
+                                        self.options.max_extracted_bytes,
+                                        &mut truncated,
+                                    ) {
+                                        break;
+                                    }
                                     fragments.push(TextFragment {
                                         text: run.text,
                                         x: run.first_x,
@@ -1402,6 +1561,7 @@ impl TextExtractor {
                                 last_y,
                                 extracted_text,
                                 fragments,
+                                truncated,
                             };
                             let mut out = self.process_operations(
                                 xobj_ops,
@@ -1422,6 +1582,7 @@ impl TextExtractor {
                             last_y = out.last_y;
                             extracted_text = out.extracted_text;
                             fragments = out.fragments;
+                            truncated = out.truncated;
                         }
                     }
                 }
@@ -1438,6 +1599,7 @@ impl TextExtractor {
             last_y,
             extracted_text,
             fragments,
+            truncated,
         })
     }
 
@@ -1507,30 +1669,54 @@ impl TextExtractor {
 
     /// Sort text fragments by position and merge them appropriately
     fn sort_and_merge_fragments(&self, fragments: &mut [TextFragment]) {
-        // Sort fragments by Y position (top to bottom) then X position (left to right).
+        // Establish reading order (top-to-bottom, left-to-right) without ever
+        // collapsing two distinct visual lines into one.
         //
-        // We quantize Y into bands of `newline_threshold` width so that fragments
-        // on the "same line" get identical Y keys. This ensures the comparator is
-        // a strict total order (transitive), which Rust's sort algorithm requires.
-        // Without quantization, threshold-based "same line" detection breaks
-        // transitivity: A≈B and B≈C does NOT imply A≈C.
-        let threshold = self.options.newline_threshold;
-        fragments.sort_by(|a, b| {
-            // Quantize Y to nearest band (PDF Y increases upward, so negate first)
-            let band_a = if threshold > 0.0 {
-                (-a.y / threshold).round()
-            } else {
-                -a.y
-            };
-            let band_b = if threshold > 0.0 {
-                (-b.y / threshold).round()
-            } else {
-                -b.y
-            };
+        // A single `sort_by` with a threshold-based "same line" comparator is not
+        // transitive (A≈B, B≈C ⇏ A≈C), which Rust's sort requires. The previous
+        // implementation restored transitivity by quantizing Y into fixed bands of
+        // `newline_threshold` width — but fixed bands collide two lines that
+        // straddle a band boundary while sitting closer than the band width. With
+        // 8pt leading under the 10pt default, y=684 → band −68 and y=676 → band
+        // −68 land in the same band; the secondary X sort then interleaved the two
+        // lines glyph-by-glyph, shredding any token that straddled the corruption
+        // (issue #408).
+        //
+        // Instead, sort in two transitive phases over an index permutation. First
+        // by exact Y (top-to-bottom — a real total order). Then group consecutive
+        // fragments into visual lines with a jitter tolerance anchored to the
+        // line's head, matching `merge_into_lines` (`height * 0.2`, which tracks
+        // font size, not the paragraph-break `newline_threshold`), and order each
+        // line left-to-right by X. Ties broken by original index keep it stable.
+        let n = fragments.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&i, &j| fragments[j].y.total_cmp(&fragments[i].y).then(i.cmp(&j)));
 
-            // Compare by Y band (top to bottom), then by X within same band
-            band_a.total_cmp(&band_b).then_with(|| a.x.total_cmp(&b.x))
-        });
+        let mut line_start = 0usize;
+        while line_start < n {
+            let head_y = fragments[order[line_start]].y;
+            let head_h = fragments[order[line_start]].height;
+            let mut line_end = line_start + 1;
+            while line_end < n {
+                let frag = &fragments[order[line_end]];
+                let tol = head_h.min(frag.height) * 0.2;
+                // Negated `< tol` (not `>= tol`) so a non-finite Y from a
+                // degenerate text matrix forces a line break instead of a
+                // NaN comparison silently swallowing every remaining fragment.
+                if !((head_y - frag.y).abs() < tol) {
+                    break;
+                }
+                line_end += 1;
+            }
+            order[line_start..line_end].sort_by(|&i, &j| fragments[i].x.total_cmp(&fragments[j].x));
+            line_start = line_end;
+        }
+
+        // Apply the permutation in place (one clone per fragment, then move back).
+        let reordered: Vec<TextFragment> = order.iter().map(|&i| fragments[i].clone()).collect();
+        for (slot, frag) in fragments.iter_mut().zip(reordered) {
+            *slot = frag;
+        }
 
         // Detect columns if requested. `reorder_columns` forces column detection
         // only on the flat path (`!preserve_layout`); in layout mode `detect_columns`
@@ -1996,6 +2182,65 @@ impl Default for TextExtractor {
 /// page from `partition_with(...)` / `rag_chunks(...)` (issue #330).
 fn skip_artifact_text(state: &TextState, include_artifacts: bool) -> bool {
     !include_artifacts && state.mc_stack.iter().any(|e| e.is_artifact)
+}
+
+/// Append an optional `separator` plus `decoded` to `acc`, honouring the
+/// per-page byte budget `limit` (issue #382).
+///
+/// Returns `true` when the run was appended. Returns `false` — appending
+/// nothing and setting `*truncated` — when the combined bytes would exceed
+/// `limit`. The separator is counted against the budget so the invariant
+/// `acc.len() <= limit` holds *exactly*, and because whole runs are the unit of
+/// truncation a multi-byte UTF-8 character is never split (undershoot
+/// semantics). A `None` limit always appends and never truncates, keeping the
+/// no-limit path byte-identical to before. Once `*truncated` is set the helper
+/// is a no-op, so a caller that keeps calling it after the budget is reached
+/// simply accumulates nothing further.
+fn append_bounded(
+    acc: &mut String,
+    separator: Option<char>,
+    decoded: &str,
+    limit: Option<usize>,
+    truncated: &mut bool,
+) -> bool {
+    if *truncated {
+        return false;
+    }
+    if let Some(max) = limit {
+        let add = separator.map_or(0, char::len_utf8) + decoded.len();
+        if acc.len() + add > max {
+            *truncated = true;
+            return false;
+        }
+    }
+    if let Some(sep) = separator {
+        acc.push(sep);
+    }
+    acc.push_str(decoded);
+    true
+}
+
+/// Defensive final clamp of a page's text to the byte budget (issue #382).
+///
+/// The `preserve_layout` / `reorder_columns` paths rebuild `.text` from the
+/// already-bounded fragment set via `reconstruct_text_from_fragments`, which
+/// reorders fragments and inserts its own separators — so the reconstructed
+/// length is not provably `<= limit` from the accumulation-time accounting
+/// alone. This clamps the result to `limit` at a UTF-8 char boundary (never
+/// splitting a character) and sets `*truncated` if it had to cut, making the
+/// `text.len() <= max_extracted_bytes` invariant hold for *every* path. A no-op
+/// when there is no limit or the text already fits.
+fn clamp_to_budget(text: &mut String, limit: Option<usize>, truncated: &mut bool) {
+    if let Some(max) = limit {
+        if text.len() > max {
+            let mut cut = max;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            *truncated = true;
+        }
+    }
 }
 
 fn emit_text_fragment(
@@ -2535,6 +2780,99 @@ fn standard_14_space_width(base_font: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    // ── issue #382: per-page byte-budget helper ──────────────────────────────
+
+    #[test]
+    fn test_append_bounded_no_limit_always_appends() {
+        let mut s = String::new();
+        let mut trunc = false;
+        assert!(append_bounded(&mut s, None, "hello", None, &mut trunc));
+        assert!(append_bounded(&mut s, Some(' '), "world", None, &mut trunc));
+        assert_eq!(s, "hello world");
+        assert!(!trunc, "no limit never truncates");
+    }
+
+    #[test]
+    fn test_append_bounded_undershoot_counts_separator() {
+        // "abcd" (4) is at budget 5; a Some('\n') + "x" would need 2 more → over.
+        let mut s = String::from("abcd");
+        let mut trunc = false;
+        assert!(!append_bounded(
+            &mut s,
+            Some('\n'),
+            "x",
+            Some(5),
+            &mut trunc
+        ));
+        assert_eq!(s, "abcd", "nothing appended when it would overshoot");
+        assert!(trunc, "budget hit sets truncated");
+        // Exactly-fits case: "e" alone (1 byte, no separator) reaches 5.
+        let mut s2 = String::from("abcd");
+        let mut t2 = false;
+        assert!(append_bounded(&mut s2, None, "e", Some(5), &mut t2));
+        assert_eq!(s2, "abcde");
+        assert!(!t2);
+        assert!(s2.len() <= 5, "invariant: len <= limit exactly");
+    }
+
+    #[test]
+    fn test_append_bounded_zero_limit_truncates_immediately() {
+        let mut s = String::new();
+        let mut trunc = false;
+        assert!(!append_bounded(&mut s, None, "a", Some(0), &mut trunc));
+        assert!(s.is_empty());
+        assert!(trunc);
+    }
+
+    #[test]
+    fn test_append_bounded_is_noop_once_truncated() {
+        let mut s = String::from("kept");
+        let mut trunc = true; // already truncated
+        assert!(!append_bounded(
+            &mut s,
+            None,
+            "more",
+            Some(1_000),
+            &mut trunc
+        ));
+        assert_eq!(s, "kept", "no further accumulation after truncation");
+    }
+
+    #[test]
+    fn test_clamp_to_budget_no_limit_or_fits_is_noop() {
+        let mut a = String::from("hello");
+        let mut t = false;
+        clamp_to_budget(&mut a, None, &mut t);
+        assert_eq!(a, "hello");
+        assert!(!t, "no limit never truncates");
+
+        let mut b = String::from("hi");
+        clamp_to_budget(&mut b, Some(10), &mut t);
+        assert_eq!(b, "hi", "already fits");
+        assert!(!t);
+    }
+
+    #[test]
+    fn test_clamp_to_budget_cuts_and_flags() {
+        let mut s = String::from("abcdefgh");
+        let mut t = false;
+        clamp_to_budget(&mut s, Some(3), &mut t);
+        assert_eq!(s, "abc");
+        assert!(t, "clamp that cut must set truncated");
+    }
+
+    #[test]
+    fn test_clamp_to_budget_never_splits_utf8() {
+        // "é" is 2 bytes (0xC3 0xA9). A 3-byte budget on "éé" (4 bytes) must cut
+        // back to the char boundary at 2, keeping one whole "é".
+        let mut s = String::from("éé");
+        let mut t = false;
+        clamp_to_budget(&mut s, Some(3), &mut t);
+        assert_eq!(s, "é", "must retreat to a char boundary, not split 'é'");
+        assert!(s.len() <= 3);
+        assert!(t);
+    }
+
     #[test]
     fn test_matrix_multiplication() {
         let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -2582,6 +2920,7 @@ mod tests {
             reconstruct_paragraphs: false,
             include_artifacts: false,
             reorder_columns: false,
+            max_extracted_bytes: None,
         };
         assert!(options.preserve_layout);
         assert_eq!(options.space_threshold, 0.5);
@@ -2710,6 +3049,7 @@ mod tests {
         let extracted = ExtractedText {
             text: "Hello World".to_string(),
             fragments: fragments,
+            truncated: false,
         };
 
         assert_eq!(extracted.text, "Hello World");
@@ -2783,6 +3123,7 @@ mod tests {
             reconstruct_paragraphs: false,
             include_artifacts: false,
             reorder_columns: false,
+            max_extracted_bytes: None,
         };
         let extractor = TextExtractor::with_options(options.clone());
         assert_eq!(extractor.options.preserve_layout, options.preserve_layout);
@@ -3938,5 +4279,34 @@ mod tests {
         let props = MarkedContentProps::ResourceRef("PropsName".to_string());
         let (mcid, _) = super::resolve_props(&props, Some(&properties));
         assert_eq!(mcid, None);
+    }
+
+    #[test]
+    fn sort_and_merge_fragments_nan_y_does_not_swallow_other_lines() {
+        // A fragment with a non-finite Y (reachable from a degenerate text
+        // matrix in a malformed PDF) must not chain every remaining fragment
+        // into one pseudo-line. The tolerance filter compares with `< tol`; a
+        // `>= tol` phrasing would let a NaN anchor never terminate the line,
+        // collapsing the whole page into a single X-sorted "line".
+        let extractor = TextExtractor::with_options(ExtractionOptions::default());
+
+        // Four well-separated lines whose X order is the reverse of their Y
+        // (reading) order: if the NaN anchor swallows the rest, they get
+        // re-sorted purely by X into D,C,B,A instead of the reading order.
+        let mut fragments = vec![
+            tf("A", 400.0, f64::NAN, 10.0, 12.0),
+            tf("B", 300.0, 500.0, 10.0, 12.0),
+            tf("C", 200.0, 300.0, 10.0, 12.0),
+            tf("D", 100.0, 100.0, 10.0, 12.0),
+        ];
+        extractor.sort_and_merge_fragments(&mut fragments);
+
+        let order: Vec<&str> = fragments.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["A", "B", "C", "D"],
+            "NaN-Y fragment must stay its own line; the finite lines keep \
+             top-to-bottom reading order instead of collapsing to X order"
+        );
     }
 }

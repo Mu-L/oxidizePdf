@@ -1409,9 +1409,10 @@ impl<R: Read + Seek> PdfDocument<R> {
         config: crate::pipeline::HybridChunkConfig,
     ) -> ParseResult<Vec<crate::pipeline::RagChunk>> {
         let elements = self.partition()?;
+        let context_mode = config.context_mode;
         let chunker = crate::pipeline::HybridChunker::new(config);
         let hybrid_chunks = chunker.chunk(&elements);
-        Ok(self.build_rag_chunks(&hybrid_chunks, None))
+        Ok(self.build_rag_chunks(&hybrid_chunks, None, context_mode))
     }
 
     /// Extract and chunk with a custom [`TokenCounter`](crate::pipeline::TokenCounter).
@@ -1431,9 +1432,10 @@ impl<R: Read + Seek> PdfDocument<R> {
         counter: std::sync::Arc<dyn crate::pipeline::TokenCounter>,
     ) -> ParseResult<Vec<crate::pipeline::RagChunk>> {
         let elements = self.partition()?;
+        let context_mode = config.context_mode;
         let chunker = crate::pipeline::HybridChunker::new(config).with_token_counter(counter);
         let hybrid_chunks = chunker.chunk(&elements);
-        Ok(self.build_rag_chunks(&hybrid_chunks, None))
+        Ok(self.build_rag_chunks(&hybrid_chunks, None, context_mode))
     }
 
     /// Build RAG chunks stamped with source-document metadata.
@@ -1490,9 +1492,10 @@ impl<R: Read + Seek> PdfDocument<R> {
     ) -> ParseResult<Vec<crate::pipeline::RagChunk>> {
         self.autofill_source(&mut source);
         let elements = self.partition()?;
+        let context_mode = config.context_mode;
         let chunker = crate::pipeline::HybridChunker::new(config);
         let hybrid_chunks = chunker.chunk(&elements);
-        Ok(self.build_rag_chunks(&hybrid_chunks, Some(source)))
+        Ok(self.build_rag_chunks(&hybrid_chunks, Some(source), context_mode))
     }
 
     /// Fill `title`/`author`/`creation_date`/`total_pages` from the info
@@ -1605,7 +1608,7 @@ impl<R: Read + Seek> PdfDocument<R> {
         // `mut` is needed only for the enricher pass below (gated `semantic`);
         // without that feature the binding is never mutated — silence the warning.
         #[allow(unused_mut)]
-        let mut chunks = self.build_rag_chunks(&hybrid, source);
+        let mut chunks = self.build_rag_chunks(&hybrid, source, pipeline.context_mode);
         #[cfg(feature = "semantic")]
         if !pipeline.enrichers.is_empty() {
             // Enrich each chunk's `extra` bag. The hybrid chunk (kept alongside)
@@ -1634,17 +1637,27 @@ impl<R: Read + Seek> PdfDocument<R> {
         &self,
         hybrid_chunks: &[crate::pipeline::HybridChunk],
         source: Option<crate::pipeline::DocumentSource>,
+        context_mode: crate::pipeline::ContextMode,
     ) -> Vec<crate::pipeline::RagChunk> {
         let mut chunks: Vec<crate::pipeline::RagChunk> = match &source {
             Some(s) => hybrid_chunks
                 .iter()
                 .enumerate()
-                .map(|(i, hc)| crate::pipeline::RagChunk::from_hybrid_chunk_with_source(i, hc, s))
+                .map(|(i, hc)| {
+                    crate::pipeline::RagChunk::from_hybrid_chunk_with_source_and_mode(
+                        i,
+                        hc,
+                        s,
+                        context_mode,
+                    )
+                })
                 .collect(),
             None => hybrid_chunks
                 .iter()
                 .enumerate()
-                .map(|(i, hc)| crate::pipeline::RagChunk::from_hybrid_chunk(i, hc))
+                .map(|(i, hc)| {
+                    crate::pipeline::RagChunk::from_hybrid_chunk_with_mode(i, hc, context_mode)
+                })
                 .collect(),
         };
         crate::pipeline::chunk_metadata::link_chunks(&mut chunks);
@@ -1676,7 +1689,7 @@ impl<R: Read + Seek> PdfDocument<R> {
         let elements = self.partition_with_profile(profile)?;
         let chunker = crate::pipeline::HybridChunker::default();
         let hybrid_chunks = chunker.chunk(&elements);
-        Ok(self.build_rag_chunks(&hybrid_chunks, None))
+        Ok(self.build_rag_chunks(&hybrid_chunks, None, crate::pipeline::ContextMode::Heading))
     }
 
     /// Combine a pre-configured extraction profile with a custom chunking config.
@@ -1701,9 +1714,10 @@ impl<R: Read + Seek> PdfDocument<R> {
         config: crate::pipeline::HybridChunkConfig,
     ) -> ParseResult<Vec<crate::pipeline::RagChunk>> {
         let elements = self.partition_with_profile(profile)?;
+        let context_mode = config.context_mode;
         let chunker = crate::pipeline::HybridChunker::new(config);
         let hybrid_chunks = chunker.chunk(&elements);
-        Ok(self.build_rag_chunks(&hybrid_chunks, None))
+        Ok(self.build_rag_chunks(&hybrid_chunks, None, context_mode))
     }
 
     /// Extract chunks as a JSON string ready for vector store ingestion.

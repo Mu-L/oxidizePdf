@@ -56,6 +56,7 @@ fn build_chunks() -> Vec<RagChunk> {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
     parsed
         .rag_chunks_with(config)
@@ -464,6 +465,7 @@ fn rag_chunks_with_source_and_config_applies_both() {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
     let tight_source = DocumentSource::with_file(None, Some("h".to_string()));
     let tight_chunks = parsed
@@ -487,4 +489,44 @@ fn rag_chunks_with_source_and_config_applies_both() {
     assert_eq!(s.doc_hash.as_deref(), Some("h"));
     // doc_hash drives the chunk_id prefix here too.
     assert!(tight_chunks[0].metadata.chunk_id.starts_with("h:"));
+}
+
+/// `ContentTypeFlags` is pipeline output: readable off `ChunkMetadata`, and
+/// `#[non_exhaustive]` so future content flags cannot break external consumers.
+///
+/// This verifies the blindaje contract from an external crate (the integration
+/// test crate is compiled separately, so `#[non_exhaustive]` is in force here):
+///   1. the flags are readable and reflect the real document — `build_chunks`
+///      produces a table/list/code-free doc, so every chunk reports all three
+///      absent;
+///   2. the only cross-crate construction path is `default()` + field mutation.
+///      A struct literal `ContentTypeFlags { has_table: .., .. }` here would
+///      fail to compile (E0639) — that is precisely what the attribute buys.
+#[test]
+fn content_type_flags_are_output_and_non_exhaustive() {
+    use oxidize_pdf::pipeline::ContentTypeFlags;
+
+    let chunks = build_chunks();
+    assert!(!chunks.is_empty(), "expected chunks to read flags from");
+
+    // (1) Real content: the fixture has no tables, lists, or code blocks, so no
+    // chunk may claim them. Read through the non_exhaustive type from outside.
+    for (i, c) in chunks.iter().enumerate() {
+        let f = c.metadata.content_types;
+        assert!(!f.has_table, "chunk[{i}] wrongly flagged has_table");
+        assert!(!f.has_list, "chunk[{i}] wrongly flagged has_list");
+        assert!(!f.has_code, "chunk[{i}] wrongly flagged has_code");
+    }
+
+    // (2) Supported cross-crate construction: start from Default, set fields.
+    // The struct literal form is rejected by #[non_exhaustive].
+    let mut flags = ContentTypeFlags::default();
+    assert_eq!(flags, ContentTypeFlags::default());
+    flags.has_table = true;
+    assert!(flags.has_table);
+    assert_ne!(
+        flags,
+        ContentTypeFlags::default(),
+        "mutating a field must diverge from the default value"
+    );
 }

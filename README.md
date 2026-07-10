@@ -34,7 +34,7 @@ Most PDF libraries give you a wall of text. oxidize-pdf gives you **structured, 
 
 ```toml
 [dependencies]
-oxidize-pdf = "3.1"
+oxidize-pdf = "4.0"
 ```
 
 ### RAG Pipeline -- One Liner
@@ -76,6 +76,36 @@ let config = HybridChunkConfig {
 };
 let chunks = doc.rag_chunks_with(config)?;
 ```
+
+### Contextual Retrieval (no-ML)
+
+Prepend a deterministic context snippet to each chunk's `full_text` before
+embedding — the no-ML analogue of [Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval)
+/ Late Chunking, which cut retrieval failures substantially by situating each
+chunk in its document. No LLM, no GPU: the prefix is a pure function of the
+document metadata and the chunk's heading breadcrumb, so it is fully
+reproducible (stable `chunk_id`). The display `text` field stays context-free.
+
+```rust
+use oxidize_pdf::pipeline::{ContextFormat, ContextMode, DocumentSource, HybridChunkConfig};
+
+let config = HybridChunkConfig {
+    context_mode: ContextMode::Contextual(ContextFormat::Labeled),
+    ..HybridChunkConfig::default()
+};
+let source = DocumentSource::with_file(Some("annual.pdf".into()), Some("sha256-…".into()));
+let chunks = doc.rag_chunks_with_source_and_config(source, config)?;
+
+// chunk.full_text now reads, e.g.:
+//   Document: Annual Report — Acme Corp
+//   Section: 1 Introduction › 1.2 Scope (p. 3–4)
+//
+//   <chunk text>
+```
+
+`ContextFormat::Prose` renders the same facts as one natural-language sentence.
+Modes: `ContextMode::None` (bare text), `Heading` (leaf heading only, the
+default), `Contextual(_)` (document + section prefix).
 
 ### JSON for Vector Store Ingestion
 

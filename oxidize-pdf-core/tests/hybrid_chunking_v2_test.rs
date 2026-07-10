@@ -38,18 +38,18 @@ fn title_elem(text: &str, page: u32, y: f64) -> Element {
 }
 
 fn make_small_table() -> Element {
-    Element::Table(TableElementData {
-        rows: vec![
+    Element::Table(TableElementData::new(
+        vec![
             vec!["Header A".to_string(), "Header B".to_string()],
             vec!["Row 1A".to_string(), "Row 1B".to_string()],
             vec!["Row 2A".to_string(), "Row 2B".to_string()],
         ],
-        metadata: ElementMetadata {
+        ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 400.0, 400.0, 100.0),
             ..Default::default()
         },
-    })
+    ))
 }
 
 fn frag(text: &str, x: f64, y: f64, font_size: f64) -> TextFragment {
@@ -88,6 +88,7 @@ fn test_merge_paragraph_and_list_item_under_same_heading() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -113,6 +114,7 @@ fn test_same_type_only_policy_preserves_legacy_behavior() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
     assert_eq!(
@@ -134,6 +136,7 @@ fn test_title_never_merges_with_adjacent_paragraph() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
     // Title must be its own chunk — it is structural, not inline.
@@ -163,6 +166,7 @@ fn test_table_never_merges_with_adjacent_paragraph() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
     // Table must be isolated in its own chunk.
@@ -193,6 +197,7 @@ fn test_oversized_paragraph_splits_at_sentence_boundary() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -226,20 +231,21 @@ fn test_table_oversized_remains_atomic_not_split() {
     let big_rows: Vec<Vec<String>> = (0..100)
         .map(|i| vec![format!("key_{}", i), format!("value_{}", i)])
         .collect();
-    let elements = vec![Element::Table(TableElementData {
-        rows: big_rows,
-        metadata: ElementMetadata {
+    let elements = vec![Element::Table(TableElementData::new(
+        big_rows,
+        ElementMetadata {
             page: 0,
             bbox: ElementBBox::new(50.0, 300.0, 400.0, 400.0),
             ..Default::default()
         },
-    })];
+    ))];
     let chunker = HybridChunker::new(HybridChunkConfig {
         max_tokens: 20,
         overlap_tokens: 0,
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -266,6 +272,7 @@ fn test_single_very_long_sentence_stays_in_one_chunk() {
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
     // No sentence boundaries → entire text is one "sentence" → one chunk.
@@ -286,6 +293,7 @@ fn test_sentence_split_preserves_parent_heading_metadata() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -379,6 +387,7 @@ fn test_hybrid_chunker_v2_end_to_end_with_partition() {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
 
     let graph = ElementGraph::build(&elements);

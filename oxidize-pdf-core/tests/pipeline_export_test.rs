@@ -56,14 +56,14 @@ fn test_export_paragraph_produces_plain_text() {
 #[test]
 fn test_export_table_pipe_format() {
     let exporter = ElementMarkdownExporter::default();
-    let elements = vec![Element::Table(TableElementData {
-        rows: vec![
+    let elements = vec![Element::Table(TableElementData::new(
+        vec![
             vec!["Name".to_string(), "Age".to_string()],
             vec!["Alice".to_string(), "30".to_string()],
             vec!["Bob".to_string(), "25".to_string()],
         ],
-        metadata: meta(),
-    })];
+        meta(),
+    ))];
     let output = exporter.export(&elements);
     assert!(output.contains("| Name | Age |"));
     assert!(output.contains("| --- | --- |"));

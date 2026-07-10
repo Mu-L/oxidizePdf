@@ -28,6 +28,7 @@ pub fn make_rag_chunk(
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&[Element::Paragraph(ElementData {
         text: text.to_string(),

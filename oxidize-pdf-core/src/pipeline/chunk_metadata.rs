@@ -75,8 +75,16 @@ impl Aggregates {
 }
 
 /// Boolean flags describing the kinds of content present in a chunk.
+///
+/// Pipeline output: the chunker derives these from a chunk's element types;
+/// external consumers read them off [`ChunkMetadata::content_types`]. Like the
+/// enclosing [`ChunkMetadata`], this is `#[non_exhaustive]` so future content
+/// flags (e.g. `has_formula`, `has_footnote`) can be added without a breaking
+/// change. To build one outside the crate (e.g. in a test), start from
+/// [`ContentTypeFlags::default`] and set the fields you need.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "semantic", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub struct ContentTypeFlags {
     /// The chunk contains at least one table element.
     pub has_table: bool,
@@ -265,14 +273,17 @@ fn table_dims(elements: &[Element]) -> (Option<usize>, Option<usize>) {
     elements
         .iter()
         .filter_map(|e| match e {
-            Element::Table(t) => Some(&t.rows),
+            Element::Table(t) => Some(match &t.structure {
+                Some(st) => (st.num_rows, st.num_cols),
+                None => (
+                    t.rows.len(),
+                    t.rows.iter().map(|r| r.len()).max().unwrap_or(0),
+                ),
+            }),
             _ => None,
         })
-        .max_by_key(|rows| rows.len())
-        .map(|rows| {
-            let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-            (Some(rows.len()), Some(cols))
-        })
+        .max_by_key(|(rows, _)| *rows)
+        .map(|(r, c)| (Some(r), Some(c)))
         .unwrap_or((None, None))
 }
 
@@ -406,13 +417,13 @@ pub(crate) fn sentence_count(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::element::{Element, ElementData, ElementMetadata};
+    use crate::pipeline::element::{Element, ElementData, ElementMetadata, TableStructure};
 
     fn table_el() -> Element {
-        Element::Table(crate::pipeline::element::TableElementData {
-            rows: vec![],
-            metadata: crate::pipeline::element::ElementMetadata::default(),
-        })
+        Element::Table(crate::pipeline::element::TableElementData::new(
+            vec![],
+            crate::pipeline::element::ElementMetadata::default(),
+        ))
     }
 
     #[test]
@@ -626,13 +637,12 @@ mod tests {
     }
 
     fn table_with(rows: Vec<Vec<&str>>) -> Element {
-        Element::Table(crate::pipeline::element::TableElementData {
-            rows: rows
-                .into_iter()
+        Element::Table(crate::pipeline::element::TableElementData::new(
+            rows.into_iter()
                 .map(|r| r.into_iter().map(String::from).collect())
                 .collect(),
-            metadata: ElementMetadata::default(),
-        })
+            ElementMetadata::default(),
+        ))
     }
 
     #[test]
@@ -661,6 +671,30 @@ mod tests {
         let m = ChunkMetadata::from_elements(&els, "just prose", "just prose", 0, None);
         assert_eq!(m.table_rows, None);
         assert_eq!(m.table_cols, None);
+    }
+
+    #[test]
+    fn table_dims_prefers_rich_structure() {
+        // Flat `rows` says 1x1; rich `structure` says 3x4 (e.g. a merged-cell
+        // table where the flat fallback under-counts). table_dims must read
+        // the structure geometry, not the flat rows, when structure is present.
+        // Deliberately construct rows/structure out of sync (1x1 flat rows vs
+        // 3x4 structure) to prove table_dims reads structure geometry, not the
+        // flat rows view. `from_structure` would derive rows FROM structure and
+        // erase this mismatch, so this stays a same-crate struct literal
+        // (unaffected by #[non_exhaustive], which only gates cross-crate
+        // construction).
+        let el = Element::Table(crate::pipeline::element::TableElementData {
+            rows: vec![vec!["x".to_string()]],
+            structure: Some(TableStructure {
+                cells: vec![],
+                num_rows: 3,
+                num_cols: 4,
+                header_rows: 1,
+            }),
+            metadata: ElementMetadata::default(),
+        });
+        assert_eq!(table_dims(&[el]), (Some(3), Some(4)));
     }
 
     #[cfg(feature = "semantic")]

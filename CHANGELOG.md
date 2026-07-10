@@ -8,6 +8,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+## [4.0.0] - 2026-07-10
+
+### BREAKING CHANGES
+
+- `TableElementData` (`oxidize_pdf::pipeline`), and `DetectedTable` / `TableCell`
+  (`oxidize_pdf::text::table_detection`) are now `#[non_exhaustive]` and gained new public
+  fields (rich table structure / cell spans / header rows). External code can no longer
+  construct these with a struct literal or match them exhaustively. Migration: build
+  `TableElementData` via `TableElementData::new(rows, metadata)` (flat) or
+  `TableElementData::from_structure(structure, metadata)` (rich); build `TableCell` via
+  `TableCell::new(..)` and `DetectedTable` via `DetectedTable::new(..)`. (#375)
+- **Contextual chunking API (#376).** `HybridChunkConfig` gained a `context_mode` field
+  (`ContextMode`), so full struct-literal construction now requires it — use
+  `HybridChunkConfig { max_tokens, ..Default::default() }`. The default (`ContextMode::Heading`)
+  is byte-identical to previous output. New enum `ContextFormat` is `#[non_exhaustive]`.
+- **Bounded extraction fields (#382).** `ExtractionOptions` gained `max_extracted_bytes:
+  Option<usize>` and `ExtractedText` gained `truncated: bool`, so full struct-literal
+  construction of `ExtractionOptions` now requires the new field — use
+  `ExtractionOptions { ..Default::default() }`.
+- **Output-type hardening.** `ExtractedText` (`oxidize_pdf::text`) and `ContentTypeFlags`
+  (`oxidize_pdf::pipeline`) are now `#[non_exhaustive]`, so future fields can be added without a
+  breaking change. External code can no longer construct them with a struct literal: build
+  `ExtractedText` via `ExtractedText::new(text, fragments)`, and `ContentTypeFlags` via
+  `ContentTypeFlags::default()` + field assignment.
+
+### Added
+
+- **RAG table extraction quality (#375).** Merged cells (rowspan/colspan) and header rows are
+  now represented by a rich `TableStructure` / `RichCell` model on `TableElementData.structure`,
+  populated from hard signals — drawn-grid dividers (merged cells) and PDF structure tags
+  (header rows). The flat `rows` view is derived from it (spanned values repeated). GFM export
+  collapses multi-level headers (joined with `›`) and repeats merged-cell values; RAG chunk
+  metadata (`table_rows`/`table_cols`) counts the rich geometry. Borderless tables and
+  un-tagged multi-level headers remain flat — see `docs/TABLE_DETECTION_GUIDE.md`.
+- **Contextual Retrieval (no-ML) for RAG chunks (#376).** Opt-in `ContextMode::Contextual`
+  prepends a deterministic document + section snippet (title/author or filename, heading
+  breadcrumb, optional page span) to each chunk's `full_text` (the embedding text) while the
+  display `text` stays context-free. Two formats — `ContextFormat::Labeled` and `Prose`. The
+  prefix is a pure function of the source, breadcrumb and page span, so `chunk_id` stays
+  deterministic. Threaded through every `rag_chunks_with*` entry and the `unstable-spi`
+  pipeline (`AnalysisPipeline::with_context_mode`).
+- **Per-page extraction memory bound (#382).** `ExtractionOptions::max_extracted_bytes` caps
+  decoded-text accumulation *during* a page run (across the show-text arms, TJ spacing, Form
+  XObject recursion, and `/ActualText` overrides), so an adversarially inflated content stream
+  cannot materialise an unbounded `String`. Undershoot semantics: extraction stops before the
+  run that would overshoot (never splits a UTF-8 char); `ExtractedText::truncated` reports it.
+  `None` (default) is byte-identical to before.
+
+### Fixed
+
+- **Table detection no longer silently drops page text (#375).** A detected table now claims
+  only fragments it actually placed in a cell (both ruling and spatial detectors); text inside
+  the table bounding box but not in any cell falls back to prose instead of being discarded.
+  Near-empty tables (< 2 populated cells) decompose to prose. Guarded by a text-conservation
+  invariant test.
+- **Dense prose no longer shredded under column reorder (#408).** `reorder_columns` /
+  `preserve_layout` fragmented dense paragraphs character-by-character because
+  `sort_and_merge_fragments` ran twice; the double pass is removed. A `NaN` Y anchor now
+  breaks the line instead of swallowing the rest of the page.
+
 ## [3.1.1] - 2026-07-07
 
 ### Fixed
