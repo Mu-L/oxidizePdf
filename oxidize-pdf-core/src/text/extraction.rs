@@ -122,8 +122,15 @@ impl Default for ExtractionOptions {
     }
 }
 
-/// Extracted text with position information
+/// Extracted text with position information.
+///
+/// Pipeline output: returned by the `extract_text*` entry points on
+/// [`Page`](crate::page::Page) / [`PdfDocument`](crate::parser::PdfDocument).
+/// `#[non_exhaustive]` so future fields (e.g. per-run diagnostics) can be added
+/// without a breaking change — construct one outside the crate via
+/// [`ExtractedText::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExtractedText {
     /// The extracted text content
     pub text: String,
@@ -134,6 +141,20 @@ pub struct ExtractedText {
     /// bounded prefix of the page's full text rather than the whole page
     /// (issue #382). Always `false` when no limit is set.
     pub truncated: bool,
+}
+
+impl ExtractedText {
+    /// Build an `ExtractedText` from its text and fragments, with `truncated`
+    /// set to `false`. Provided because `ExtractedText` is `#[non_exhaustive]`,
+    /// so external callers cannot use a struct literal. Set [`truncated`](Self::truncated)
+    /// afterwards if you are synthesizing a bounded result.
+    pub fn new(text: String, fragments: Vec<TextFragment>) -> Self {
+        Self {
+            text,
+            fragments,
+            truncated: false,
+        }
+    }
 }
 
 /// Metadata about a space insertion decision during text extraction.
