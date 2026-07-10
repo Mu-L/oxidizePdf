@@ -1507,30 +1507,54 @@ impl TextExtractor {
 
     /// Sort text fragments by position and merge them appropriately
     fn sort_and_merge_fragments(&self, fragments: &mut [TextFragment]) {
-        // Sort fragments by Y position (top to bottom) then X position (left to right).
+        // Establish reading order (top-to-bottom, left-to-right) without ever
+        // collapsing two distinct visual lines into one.
         //
-        // We quantize Y into bands of `newline_threshold` width so that fragments
-        // on the "same line" get identical Y keys. This ensures the comparator is
-        // a strict total order (transitive), which Rust's sort algorithm requires.
-        // Without quantization, threshold-based "same line" detection breaks
-        // transitivity: A≈B and B≈C does NOT imply A≈C.
-        let threshold = self.options.newline_threshold;
-        fragments.sort_by(|a, b| {
-            // Quantize Y to nearest band (PDF Y increases upward, so negate first)
-            let band_a = if threshold > 0.0 {
-                (-a.y / threshold).round()
-            } else {
-                -a.y
-            };
-            let band_b = if threshold > 0.0 {
-                (-b.y / threshold).round()
-            } else {
-                -b.y
-            };
+        // A single `sort_by` with a threshold-based "same line" comparator is not
+        // transitive (A≈B, B≈C ⇏ A≈C), which Rust's sort requires. The previous
+        // implementation restored transitivity by quantizing Y into fixed bands of
+        // `newline_threshold` width — but fixed bands collide two lines that
+        // straddle a band boundary while sitting closer than the band width. With
+        // 8pt leading under the 10pt default, y=684 → band −68 and y=676 → band
+        // −68 land in the same band; the secondary X sort then interleaved the two
+        // lines glyph-by-glyph, shredding any token that straddled the corruption
+        // (issue #408).
+        //
+        // Instead, sort in two transitive phases over an index permutation. First
+        // by exact Y (top-to-bottom — a real total order). Then group consecutive
+        // fragments into visual lines with a jitter tolerance anchored to the
+        // line's head, matching `merge_into_lines` (`height * 0.2`, which tracks
+        // font size, not the paragraph-break `newline_threshold`), and order each
+        // line left-to-right by X. Ties broken by original index keep it stable.
+        let n = fragments.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&i, &j| fragments[j].y.total_cmp(&fragments[i].y).then(i.cmp(&j)));
 
-            // Compare by Y band (top to bottom), then by X within same band
-            band_a.total_cmp(&band_b).then_with(|| a.x.total_cmp(&b.x))
-        });
+        let mut line_start = 0usize;
+        while line_start < n {
+            let head_y = fragments[order[line_start]].y;
+            let head_h = fragments[order[line_start]].height;
+            let mut line_end = line_start + 1;
+            while line_end < n {
+                let frag = &fragments[order[line_end]];
+                let tol = head_h.min(frag.height) * 0.2;
+                // Negated `< tol` (not `>= tol`) so a non-finite Y from a
+                // degenerate text matrix forces a line break instead of a
+                // NaN comparison silently swallowing every remaining fragment.
+                if !((head_y - frag.y).abs() < tol) {
+                    break;
+                }
+                line_end += 1;
+            }
+            order[line_start..line_end].sort_by(|&i, &j| fragments[i].x.total_cmp(&fragments[j].x));
+            line_start = line_end;
+        }
+
+        // Apply the permutation in place (one clone per fragment, then move back).
+        let reordered: Vec<TextFragment> = order.iter().map(|&i| fragments[i].clone()).collect();
+        for (slot, frag) in fragments.iter_mut().zip(reordered) {
+            *slot = frag;
+        }
 
         // Detect columns if requested. `reorder_columns` forces column detection
         // only on the flat path (`!preserve_layout`); in layout mode `detect_columns`
@@ -3938,5 +3962,34 @@ mod tests {
         let props = MarkedContentProps::ResourceRef("PropsName".to_string());
         let (mcid, _) = super::resolve_props(&props, Some(&properties));
         assert_eq!(mcid, None);
+    }
+
+    #[test]
+    fn sort_and_merge_fragments_nan_y_does_not_swallow_other_lines() {
+        // A fragment with a non-finite Y (reachable from a degenerate text
+        // matrix in a malformed PDF) must not chain every remaining fragment
+        // into one pseudo-line. The tolerance filter compares with `< tol`; a
+        // `>= tol` phrasing would let a NaN anchor never terminate the line,
+        // collapsing the whole page into a single X-sorted "line".
+        let extractor = TextExtractor::with_options(ExtractionOptions::default());
+
+        // Four well-separated lines whose X order is the reverse of their Y
+        // (reading) order: if the NaN anchor swallows the rest, they get
+        // re-sorted purely by X into D,C,B,A instead of the reading order.
+        let mut fragments = vec![
+            tf("A", 400.0, f64::NAN, 10.0, 12.0),
+            tf("B", 300.0, 500.0, 10.0, 12.0),
+            tf("C", 200.0, 300.0, 10.0, 12.0),
+            tf("D", 100.0, 100.0, 10.0, 12.0),
+        ];
+        extractor.sort_and_merge_fragments(&mut fragments);
+
+        let order: Vec<&str> = fragments.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["A", "B", "C", "D"],
+            "NaN-Y fragment must stay its own line; the finite lines keep \
+             top-to-bottom reading order instead of collapsing to X order"
+        );
     }
 }
