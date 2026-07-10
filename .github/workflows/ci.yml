@@ -56,7 +56,16 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        # Drive rustfmt directly in xargs-chunked batches instead of `cargo fmt`.
+        # `cargo fmt --all` passes every workspace target root (~400+ examples/tests)
+        # to a single rustfmt invocation; on windows-latest that command line exceeds
+        # the ~32 KiB CreateProcess limit and fails with `os error 206` (ERROR_FILENAME_
+        # EXCED_RANGE) before checking anything. xargs splits into bounded batches, so
+        # this stays correct as the target count grows. bash runs on all three runners.
+        shell: bash
+        run: >
+          find oxidize-pdf-core -name '*.rs' -not -path '*/target/*' -not -path '*/benches.disabled/*' -print0
+          | xargs -0 -r -n 60 rustfmt --edition 2021 --check
 
       - name: Check for backup files
         if: matrix.os != 'windows-latest'
