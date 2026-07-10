@@ -75,8 +75,16 @@ impl Aggregates {
 }
 
 /// Boolean flags describing the kinds of content present in a chunk.
+///
+/// Pipeline output: the chunker derives these from a chunk's element types;
+/// external consumers read them off [`ChunkMetadata::content_types`]. Like the
+/// enclosing [`ChunkMetadata`], this is `#[non_exhaustive]` so future content
+/// flags (e.g. `has_formula`, `has_footnote`) can be added without a breaking
+/// change. To build one outside the crate (e.g. in a test), start from
+/// [`ContentTypeFlags::default`] and set the fields you need.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "semantic", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub struct ContentTypeFlags {
     /// The chunk contains at least one table element.
     pub has_table: bool,
