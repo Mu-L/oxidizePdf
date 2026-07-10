@@ -168,6 +168,7 @@ fn synthetic_overflow_flushes_emit_disjoint_chunks() {
         merge_adjacent: true,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 
@@ -206,6 +207,7 @@ fn synthetic_merge_disabled_with_overlap_still_disjoint() {
         merge_adjacent: false,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let chunks = chunker.chunk(&elements);
 

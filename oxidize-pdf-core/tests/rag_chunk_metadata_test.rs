@@ -56,6 +56,7 @@ fn build_chunks() -> Vec<RagChunk> {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
     parsed
         .rag_chunks_with(config)
@@ -464,6 +465,7 @@ fn rag_chunks_with_source_and_config_applies_both() {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     };
     let tight_source = DocumentSource::with_file(None, Some("h".to_string()));
     let tight_chunks = parsed

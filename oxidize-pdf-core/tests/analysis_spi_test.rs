@@ -45,6 +45,7 @@ fn hybrid_chunker_is_the_default_strategy() {
         merge_adjacent: true,
         propagate_headings: true,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
 
     // Inherent API: Vec<HybridChunk>.
@@ -172,6 +173,7 @@ fn decorator_wraps_default_and_refines() {
         merge_adjacent: false,
         propagate_headings: false,
         merge_policy: MergePolicy::AnyInlineContent,
+        context_mode: Default::default(),
     });
     let base_count = ChunkingStrategy::chunk(&inner, &elements).len();
     assert_eq!(base_count, 4, "default emits one group per element here");
@@ -548,5 +550,41 @@ fn pipeline_owns_oversized_flag_regardless_of_strategy() {
     assert!(
         none_over.iter().all(|c| !c.is_oversized),
         "generous budget → no chunk is oversized"
+    );
+}
+
+/// Issue #376 (QR critical): `context_mode` set on the pipeline must reach
+/// `full_text` through the SPI path, not be silently dropped to `Heading`.
+#[test]
+fn pipeline_context_mode_threads_through_spi_path() {
+    use oxidize_pdf::pipeline::{ContextFormat, ContextMode, DocumentSource};
+    let bytes = build_two_section_doc();
+
+    // Default pipeline (Heading): no contextual `Document:`/`Section:` prefix.
+    let parsed = PdfDocument::new(PdfReader::new(Cursor::new(&bytes)).unwrap());
+    let heading = parsed
+        .rag_chunks_with_pipeline(&AnalysisPipeline::new())
+        .expect("rag_chunks_with_pipeline");
+    assert!(
+        !heading.iter().any(|c| c.full_text.contains("Document:")),
+        "default pipeline must not add a contextual prefix"
+    );
+
+    // Contextual mode set on the pipeline must reach every chunk's full_text.
+    let mut source = DocumentSource::with_file(Some("two.pdf".into()), Some("h".into()));
+    source.title = Some("Two Section Doc".into());
+    let parsed = PdfDocument::new(PdfReader::new(Cursor::new(&bytes)).unwrap());
+    let pipeline = AnalysisPipeline::new()
+        .with_source(source)
+        .with_context_mode(ContextMode::Contextual(ContextFormat::Labeled));
+    let ctx = parsed
+        .rag_chunks_with_pipeline(&pipeline)
+        .expect("rag_chunks_with_pipeline");
+    assert!(!ctx.is_empty(), "fixture must produce chunks");
+    assert!(
+        ctx.iter()
+            .all(|c| c.full_text.starts_with("Document: Two Section Doc")),
+        "context_mode must thread through the SPI path: {:?}",
+        ctx.iter().map(|c| c.full_text.clone()).collect::<Vec<_>>()
     );
 }
