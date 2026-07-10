@@ -339,7 +339,11 @@ mod tests {
             .map(|f| f.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        ExtractedText { text, fragments }
+        ExtractedText {
+            text,
+            fragments,
+            truncated: false,
+        }
     }
 
     #[test]
@@ -347,6 +351,7 @@ mod tests {
         let page = ExtractedText {
             text: "Hello".to_string(),
             fragments: vec![make_fragment("Hello", 100.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
@@ -367,6 +372,7 @@ mod tests {
                 make_fragment("World", 160.0, 700.0, 55.0, 12.0),
                 make_fragment("Test", 225.0, 700.0, 40.0, 12.0),
             ],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
@@ -383,10 +389,12 @@ mod tests {
         let page1 = ExtractedText {
             text: "Page one".to_string(),
             fragments: vec![make_fragment("Page one", 72.0, 700.0, 80.0, 12.0)],
+            truncated: false,
         };
         let page2 = ExtractedText {
             text: "Page two".to_string(),
             fragments: vec![make_fragment("Page two", 72.0, 700.0, 80.0, 12.0)],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page1, page2]);
 
@@ -405,6 +413,7 @@ mod tests {
         let page = ExtractedText {
             text: "Hello".to_string(),
             fragments: vec![make_fragment("Hello", 100.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
@@ -417,6 +426,7 @@ mod tests {
         let page = ExtractedText {
             text: "Hello".to_string(),
             fragments: vec![make_fragment("Hello", 100.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
@@ -434,6 +444,7 @@ mod tests {
         let page = ExtractedText {
             text: "Hello".to_string(),
             fragments: vec![make_fragment("Hello", 100.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
@@ -477,6 +488,7 @@ mod tests {
         let page1 = ExtractedText {
             text: "AAA".to_string(),
             fragments: vec![make_fragment("AAA", 72.0, 700.0, 30.0, 12.0)],
+            truncated: false,
         };
         let page2 = ExtractedText {
             text: "BBB CCC".to_string(),
@@ -484,6 +496,7 @@ mod tests {
                 make_fragment("BBB", 72.0, 700.0, 30.0, 12.0),
                 make_fragment("CCC", 110.0, 700.0, 30.0, 12.0),
             ],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page1, page2]);
 
@@ -502,14 +515,17 @@ mod tests {
         let page1 = ExtractedText {
             text: "ABCDE".to_string(), // 5 chars
             fragments: vec![make_fragment("ABCDE", 72.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let page2 = ExtractedText {
             text: "FGHIJ".to_string(), // 5 chars
             fragments: vec![make_fragment("FGHIJ", 72.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let page3 = ExtractedText {
             text: "KLMNO".to_string(), // 5 chars
             fragments: vec![make_fragment("KLMNO", 72.0, 700.0, 50.0, 12.0)],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page1, page2, page3]);
 
@@ -532,6 +548,7 @@ mod tests {
                 make_fragment("", 130.0, 700.0, 10.0, 12.0), // empty fragment
                 make_fragment("World", 145.0, 700.0, 55.0, 12.0),
             ],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
@@ -551,6 +568,7 @@ mod tests {
                 make_fragment("CCC", 150.0, 700.0, 30.0, 12.0),
                 make_fragment("DDD", 190.0, 700.0, 30.0, 12.0),
             ],
+            truncated: false,
         };
         let index = TextPositionIndex::build(&[page]);
 
