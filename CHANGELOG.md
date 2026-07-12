@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+### Added
+
+- **Type 4 (free-form Gouraud triangle mesh) shading** (#407). New public
+  `FreeFormGouraudShading` + `GouraudVertex` (re-exported from `graphics`)
+  emit a Type 4 mesh as a PDF stream per ISO 32000-1 §8.7.4.5.5 — the shading
+  dictionary plus byte-aligned packed vertex data (configurable
+  `BitsPerCoordinate`/`BitsPerComponent`/`BitsPerFlag` and `Decode`). Register
+  on a page with `Page::add_mesh_shading`.
+- **Exact conic (angular) gradient** (#407). New public `ConicShading` emits a
+  Type 1 function-based shading whose `/Function` is a real Type 4 PostScript
+  calculator (angle around a center → colour ramp), so conic gradients are
+  resolution-independent rather than a mesh approximation. Register with
+  `Page::add_conic_shading`. This unblocks lossless `conic-gradient` rendering
+  downstream. The pre-existing hollow `FunctionBasedShading` placeholder is
+  unchanged.
+
+  Both are additive: `ShadingDefinition` and existing types are untouched, so
+  this is a minor release. Folding the new shadings into `ShadingDefinition`
+  and removing the `FunctionBasedShading` placeholder are deferred to the next
+  major.
+
 ### Fixed
 
 - **`reorder_columns` no longer shreds dense prose** (#417, follow-up to #408).
