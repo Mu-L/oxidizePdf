@@ -75,6 +75,12 @@ pub struct ExtractionOptions {
     /// When on, `.text` is produced by the fragment pipeline (its shape matches
     /// the layout path's reconstruction, not stream order); `.fragments` stays
     /// empty.
+    ///
+    /// Column reflow only triggers for column blocks whose rows are spaced at
+    /// least one line height apart. Layouts pitched tighter than that are
+    /// geometrically indistinguishable from tight-leading prose that merely
+    /// contains a wide gap, so they are intentionally left in reading order
+    /// rather than risk shredding prose (issue #417); text is never corrupted.
     pub reorder_columns: bool,
     /// Stop accumulating decoded text for a page once this many bytes have been
     /// collected, bounding the per-page peak memory of extraction. The limit is
@@ -1744,19 +1750,34 @@ impl TextExtractor {
         // internal gap wider than `column_threshold` — and leave full-width
         // "flow" lines in their natural reading order.
 
-        // Group fragment indices into lines by Y band. Indices (not `&mut`) so we
-        // can later reorder the slice by a computed permutation.
+        // Group fragment indices into lines. Indices (not `&mut`) so we can later
+        // reorder the slice by a computed permutation.
+        //
+        // The tolerance is anchored to the *line head* with a font-relative jitter
+        // (`min(head, frag).height * 0.2`), matching `sort_and_merge_fragments` /
+        // `merge_into_lines` (issue #408). A fixed `newline_threshold` band keyed
+        // to the *previous* fragment accumulated drift on tight (sub-threshold)
+        // leading and merged nearly a whole page into one pseudo-line, which the
+        // block reorder below then reshuffled by X, shredding tokens (issue #417).
         let mut lines: Vec<Vec<usize>> = Vec::new();
         let mut current_line: Vec<usize> = Vec::new();
-        let mut last_y = f64::INFINITY;
+        let mut head_y = f64::INFINITY;
+        let mut head_h = 0.0_f64;
         for (i, fragment) in fragments.iter().enumerate() {
-            if (last_y - fragment.y).abs() > self.options.newline_threshold
-                && !current_line.is_empty()
-            {
-                lines.push(std::mem::take(&mut current_line));
+            if !current_line.is_empty() {
+                let tol = head_h.min(fragment.height) * 0.2;
+                // Negated `< tol` (not `>= tol`) so a non-finite Y from a
+                // degenerate text matrix forces a line break rather than swallowing
+                // the whole page into one line.
+                if !((head_y - fragment.y).abs() < tol) {
+                    lines.push(std::mem::take(&mut current_line));
+                }
+            }
+            if current_line.is_empty() {
+                head_y = fragment.y;
+                head_h = fragment.height;
             }
             current_line.push(i);
-            last_y = fragment.y;
         }
         if !current_line.is_empty() {
             lines.push(current_line);
@@ -1781,16 +1802,31 @@ impl TextExtractor {
         let mut has_columnar_block = false;
         let mut seg_id = 0usize;
         let mut prev_columnar = false;
+        let mut prev_y = f64::INFINITY;
+        let mut prev_h = 0.0_f64;
 
         for (li, line) in lines.iter().enumerate() {
             let columnar = line_is_columnar(line);
-            if li > 0 && !(columnar && prev_columnar) {
+            let head = &fragments[line[0]];
+            // Two consecutive columnar lines share a multi-line column block only
+            // when they are spaced like real table rows — at least a line height
+            // apart. Tight-leading wrapped prose whose lines each happen to hold a
+            // wide (>`column_threshold`) gap forms a common whitespace corridor and
+            // is geometrically indistinguishable from a 2-column layout; merging it
+            // into a block and reordering column-major shredded the prose (#417).
+            // Below the row-height threshold each such line self-segments instead,
+            // and a single columnar line's column-major order equals its reading
+            // order, so the text is left intact.
+            let row_spaced = (prev_y - head.y).abs() >= head.height.max(prev_h);
+            if li > 0 && !(columnar && prev_columnar && row_spaced) {
                 seg_id += 1;
             }
             for &i in line {
                 segment_of[i] = seg_id;
             }
             prev_columnar = columnar;
+            prev_y = head.y;
+            prev_h = head.height;
         }
 
         // For each columnar block (a segment whose lines are columnar), derive

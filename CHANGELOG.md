@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+### Fixed
+
+- **`reorder_columns` no longer shreds dense prose** (#417, follow-up to #408).
+  `detect_and_sort_columns` grouped lines with a fixed `newline_threshold` band
+  keyed to the previous fragment, merging tight-leading prose into one
+  pseudo-line, and then treated consecutive lines that each held an incidental
+  wide gap as a multi-column table, reordering them column-major and splitting
+  tokens. Line grouping is now head-anchored (matching #408), and a multi-line
+  column block only forms when its rows are at least one line height apart;
+  tighter blocks are left in reading order. Real tables / multi-column layouts
+  are unaffected. Only the opt-in `reorder_columns` / `detect_columns` path was
+  affected.
+
 ## [4.0.1] - 2026-07-12
 
 ### Fixed
