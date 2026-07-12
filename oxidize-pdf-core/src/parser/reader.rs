@@ -18,6 +18,27 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// Resolve a dictionary value that is expected to be an array into an owned
+/// [`PdfArray`], transparently following a single level of indirection.
+///
+/// ISO 32000-1 §7.3.10 permits any object — including `/Kids` — to be written
+/// as an indirect reference (`N G R`) instead of inline; iText 5.5.9 emits page
+/// trees this way. Returns `None` if the value is absent, is neither an array
+/// nor a reference to one, or cannot be resolved. Only one level is followed,
+/// which covers every real-world page tree observed (a reference-to-a-reference
+/// `/Kids` chain is not produced by any known writer).
+pub(crate) fn resolve_to_array<R: Read + Seek>(
+    reader: &mut PdfReader<R>,
+    value: Option<&PdfObject>,
+) -> Option<PdfArray> {
+    match value {
+        Some(PdfObject::Reference(num, gen)) => {
+            reader.get_object(*num, *gen).ok()?.as_array().cloned()
+        }
+        other => other.and_then(|o| o.as_array()).cloned(),
+    }
+}
+
 /// Bounded window for manual dictionary extraction (Issue #339). Object headers
 /// are located by the chunked scanner and only this many bytes are read at the
 /// object offset, instead of buffering the whole file. Large enough for any
@@ -1115,26 +1136,48 @@ impl<R: Read + Seek> PdfReader<R> {
         // Try standard method first
         match self.pages() {
             Ok(pages) => {
-                // Try to get Count first
-                if let Some(count_obj) = pages.get("Count") {
-                    if let Some(count) = count_obj.as_integer() {
-                        let count = count as u32;
-                        if count <= MAX_PAGE_COUNT {
-                            return Ok(count);
-                        }
-                        tracing::warn!(
-                            "PDF /Count {} exceeds limit {}, falling back to Kids array length",
-                            count,
-                            MAX_PAGE_COUNT
-                        );
-                        // Fall through to Kids counting
+                // Read /Count and /Kids up front. Each may be inline or an
+                // indirect reference (ISO 32000-1 §7.3.10); extract Copy values
+                // now so the `pages` borrow ends before we resolve references.
+                let count_inline = pages.get("Count").and_then(|o| o.as_integer());
+                let count_ref = pages.get("Count").and_then(|o| o.as_reference());
+                let kids_len_inline = pages
+                    .get("Kids")
+                    .and_then(|o| o.as_array())
+                    .map(|a| a.0.len());
+                let kids_ref = pages.get("Kids").and_then(|o| o.as_reference());
+
+                // Resolve /Count to an integer, whether inline or indirect.
+                let count = count_inline.or_else(|| {
+                    count_ref
+                        .and_then(|(n, g)| self.get_object(n, g).ok().and_then(|o| o.as_integer()))
+                });
+                if let Some(count) = count {
+                    let count = count as u32;
+                    if count <= MAX_PAGE_COUNT {
+                        return Ok(count);
                     }
+                    tracing::warn!(
+                        "PDF /Count {} exceeds limit {}, falling back to Kids array length",
+                        count,
+                        MAX_PAGE_COUNT
+                    );
+                    // Fall through to Kids counting
                 }
 
-                // If Count is missing, invalid, or exceeds limit, try to count manually
-                if let Some(kids_obj) = pages.get("Kids") {
-                    if let Some(kids_array) = kids_obj.as_array() {
-                        return Ok(kids_array.0.len() as u32);
+                // If Count is missing, invalid, or exceeds limit, count the
+                // Kids array — inline or resolved from an indirect reference.
+                if let Some(len) = kids_len_inline {
+                    return Ok(len as u32);
+                }
+                if let Some((n, g)) = kids_ref {
+                    if let Some(len) = self
+                        .get_object(n, g)
+                        .ok()
+                        .and_then(|o| o.as_array())
+                        .map(|a| a.0.len())
+                    {
+                        return Ok(len as u32);
                     }
                 }
 

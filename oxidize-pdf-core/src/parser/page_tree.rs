@@ -132,6 +132,21 @@ pub struct PageTree {
     page_refs: Vec<(u32, u16)>,
 }
 
+/// Resolve a `/Kids` value into its list of page/pages object references.
+///
+/// The value may be a direct array (`/Kids [ ... ]`) or an indirect reference
+/// to an array (`/Kids N G R`), which ISO 32000-1 §7.3.10 permits for any
+/// object and iText 5.5.9 emits in practice. One level of indirection is
+/// resolved; anything else yields an empty list.
+fn resolve_kids<R: Read + Seek>(
+    reader: &mut PdfReader<R>,
+    kids_obj: Option<&PdfObject>,
+) -> Vec<(u32, u16)> {
+    super::reader::resolve_to_array(reader, kids_obj)
+        .map(|a| a.0.iter().filter_map(|k| k.as_reference()).collect())
+        .unwrap_or_default()
+}
+
 impl PageTree {
     /// Create a new page tree navigator
     pub fn new(page_count: u32) -> Self {
@@ -206,14 +221,13 @@ impl PageTree {
         // Work stack: each entry is an object reference to process
         let mut stack: Vec<(u32, u16)> = Vec::new();
 
-        // Seed from root Kids array
-        if let Some(kids) = pages_dict.get("Kids").and_then(|k| k.as_array()) {
-            // Push in reverse so first kid is processed first (LIFO stack)
-            for kid_obj in kids.0.iter().rev() {
-                if let Some(kid_ref) = kid_obj.as_reference() {
-                    stack.push(kid_ref);
-                }
-            }
+        // Seed from root Kids array.
+        // Push in reverse so first kid is processed first (LIFO stack).
+        for kid_ref in resolve_kids(reader, pages_dict.get("Kids"))
+            .into_iter()
+            .rev()
+        {
+            stack.push(kid_ref);
         }
 
         while let Some(obj_ref) = stack.pop() {
@@ -232,8 +246,10 @@ impl PageTree {
                 continue;
             }
 
-            // Resolve the object
-            let obj = match reader.get_object(obj_ref.0, obj_ref.1) {
+            // Resolve the object. Own it (clone) so the reader borrow ends
+            // here — the `Pages` arm below resolves indirect `/Kids` via the
+            // reader while this node is still in scope.
+            let obj = match reader.get_object(obj_ref.0, obj_ref.1).cloned() {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!(
@@ -274,13 +290,10 @@ impl PageTree {
                     page_refs.push(obj_ref);
                 }
                 Some("Pages") => {
-                    if let Some(kids) = dict.get("Kids").and_then(|k| k.as_array()) {
-                        // Push in reverse for correct order
-                        for kid_obj in kids.0.iter().rev() {
-                            if let Some(kid_ref) = kid_obj.as_reference() {
-                                stack.push(kid_ref);
-                            }
-                        }
+                    // Push in reverse for correct order. `/Kids` may be an
+                    // indirect reference to the array (ISO 32000-1 §7.3.10).
+                    for kid_ref in resolve_kids(reader, dict.get("Kids")).into_iter().rev() {
+                        stack.push(kid_ref);
                     }
                 }
                 _ => {

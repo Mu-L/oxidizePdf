@@ -1171,6 +1171,59 @@ mod tests {
     }
 
     #[test]
+    fn test_lzw_decode_crosses_9_to_10_bit_boundary_early_change() {
+        // Regression for issue #415 Bug 2: under EarlyChange=1 (the PDF
+        // default) the decoder must widen the code from 9 to 10 bits when the
+        // dictionary reaches 2^9 - 1 = 511 entries. A well-distributed payload
+        // grows the dictionary well past that boundary; weezl (TIFF/PDF
+        // early-change LZW) is the trusted encoder, so a byte-identical
+        // round-trip proves the boundary is handled. The previous `2^width`
+        // threshold widened one entry too late and desynced the bitstream,
+        // surfacing as `LZW decode error: invalid code <N>`.
+        let payload: Vec<u8> = (0..2000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let encoded = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .encode(&payload)
+            .expect("weezl LZW encode");
+
+        let mut params = PdfDictionary::new();
+        params.insert("EarlyChange".to_string(), PdfObject::Integer(1));
+
+        let decoded =
+            decode_lzw(&encoded, Some(&params)).expect("decode LZW across 9->10 bit boundary");
+        assert_eq!(
+            decoded, payload,
+            "round-trip must be byte-identical across the 9->10 bit code-width boundary"
+        );
+    }
+
+    #[test]
+    fn test_lzw_decode_crosses_boundary_no_early_change() {
+        // Companion to the EarlyChange=1 case: with EarlyChange=0 the writer
+        // widens the code at 2^width entries (the original/GIF timing). weezl's
+        // non-TIFF encoder produces exactly this stream. The previous
+        // `2^width + 1` threshold was one entry too late here too (issue #415
+        // Bug 2 notes both branches were off by one).
+        let payload: Vec<u8> = (0..2000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let encoded = weezl::encode::Encoder::new(weezl::BitOrder::Msb, 8)
+            .encode(&payload)
+            .expect("weezl LZW encode (no early change)");
+
+        let mut params = PdfDictionary::new();
+        params.insert("EarlyChange".to_string(), PdfObject::Integer(0));
+
+        let decoded = decode_lzw(&encoded, Some(&params))
+            .expect("decode LZW (EarlyChange=0) across the code-width boundary");
+        assert_eq!(
+            decoded, payload,
+            "round-trip must be byte-identical with EarlyChange=0 across the boundary"
+        );
+    }
+
+    #[test]
     fn test_lzw_decode_early_change_false() {
         let mut params = PdfDictionary::new();
         params.insert("EarlyChange".to_string(), PdfObject::Integer(0));
@@ -1913,10 +1966,15 @@ fn decode_lzw(data: &[u8], params: Option<&PdfDictionary>) -> ParseResult<Vec<u8
 
                 // Increase code size if necessary
                 let dict_size = dictionary.len();
+                // ISO 32000-1 §7.4.4.2: with EarlyChange=1 (the default) the
+                // writer widens the code once the table holds 2^width - 1
+                // entries; without early change, at 2^width. Using 2^width /
+                // 2^width + 1 here widened one entry too late and desynced the
+                // bitstream past 511/1023/2047 entries (issue #415 Bug 2).
                 let threshold = if early_change {
-                    1 << code_size
+                    (1 << code_size) - 1
                 } else {
-                    (1 << code_size) + 1
+                    1 << code_size
                 };
 
                 if dict_size >= threshold as usize && code_size < MAX_BITS {
