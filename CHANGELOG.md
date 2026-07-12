@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+## [4.0.1] - 2026-07-12
+
 ### Fixed
 
 - **Indirect `/Kids` and `/Count` page trees now parse** (#415). A `/Pages` node
