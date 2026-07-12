@@ -480,6 +480,205 @@ impl FreeFormGouraudShading {
     }
 }
 
+/// Assemble a Type 4 (PostScript calculator) function object (ISO 32000-1
+/// §7.10.5): a stream whose body is the calculator program `code` verbatim,
+/// with the given `/Domain` and `/Range`. Mirrors the shape used elsewhere in
+/// the crate (`devicen_color`), returned as `(dict, bytes)` for the writer to
+/// hoist to an indirect object.
+fn postscript_type4_function(code: &str, domain: &[f64], range: &[f64]) -> (Dictionary, Vec<u8>) {
+    let mut dict = Dictionary::new();
+    dict.set("FunctionType", Object::Integer(4));
+    dict.set(
+        "Domain",
+        Object::Array(domain.iter().map(|&d| Object::Real(d)).collect()),
+    );
+    dict.set(
+        "Range",
+        Object::Array(range.iter().map(|&r| Object::Real(r)).collect()),
+    );
+    (dict, code.as_bytes().to_vec())
+}
+
+/// PostScript that maps a local parameter `t ∈ [0,1]` on the stack to the `n`
+/// colour components of a two-stop linear interpolation `start → end`. Ends
+/// with the components in order (component 0 deepest).
+fn ramp2_ps(start: &Color, end: &Color, space: &str) -> String {
+    let s = color_components(start, space);
+    let e = color_components(end, space);
+    let n = s.len();
+    let mut parts = Vec::with_capacity(n);
+    for j in 0..n {
+        let block = format!("{} mul {} add", e[j] - s[j], s[j]);
+        if j + 1 < n {
+            // Keep a fresh copy of t for the next component and tuck the result
+            // beneath it, preserving output order.
+            parts.push(format!("dup {block} exch"));
+        } else {
+            parts.push(block);
+        }
+    }
+    parts.join(" ")
+}
+
+/// PostScript that remaps a global `t` on the stack to a segment-local
+/// parameter `(t - lo) / (hi - lo)`.
+fn remap_local_ps(lo: f64, hi: f64) -> String {
+    format!("{} sub {} div", lo, hi - lo)
+}
+
+/// PostScript mapping a global `t ∈ [0,1]` on the stack to colour components
+/// across `stops` (≥ 1). One stop → constant colour (discards `t`); two →
+/// [`ramp2_ps`]; more → nested `ifelse` split at the interior stop positions,
+/// each segment remapped to `[0,1]` then interpolated.
+fn build_color_ramp_ps(stops: &[ColorStop], space: &str) -> String {
+    match stops {
+        [] => String::new(),
+        [only] => {
+            let mut s = String::from("pop");
+            for c in color_components(&only.color, space) {
+                s.push_str(&format!(" {c}"));
+            }
+            s
+        }
+        [a, b] => ramp2_ps(&a.color, &b.color, space),
+        _ => build_ramp_nested_ps(stops, space),
+    }
+}
+
+/// Recursive nested-`ifelse` ramp for 3+ stops. Each level splits at the next
+/// interior stop position; the deepest level (two stops) is a remapped
+/// [`ramp2_ps`].
+fn build_ramp_nested_ps(stops: &[ColorStop], space: &str) -> String {
+    debug_assert!(stops.len() >= 2);
+    let lo = stops[0].position;
+    let hi = stops[1].position;
+    let seg0 = format!(
+        "{} {}",
+        remap_local_ps(lo, hi),
+        ramp2_ps(&stops[0].color, &stops[1].color, space)
+    );
+    if stops.len() == 2 {
+        return seg0;
+    }
+    let split = stops[1].position;
+    let rest = build_ramp_nested_ps(&stops[1..], space);
+    format!("dup {split} lt {{ {seg0} }} {{ {rest} }} ifelse")
+}
+
+/// PostScript prologue for a conic (angular) gradient: given `x y` on the
+/// stack, computes the angle of the vector from `center` and normalises it to
+/// `t = angle / 360 ∈ [0,1)`. `atan` (ISO 32000-1 Table 42) takes `num den`
+/// and returns `atan2(num, den)` in degrees `[0,360)`; with `dy dx` on the
+/// stack it yields the angle of `(dx, dy)`.
+fn build_conic_angle_prologue(center: Point) -> String {
+    // stack: x y → (y - cy)=dy, exch, (x - cx)=dx → dy dx → atan → /360.
+    format!("{} sub exch {} sub atan 360 div", center.y, center.x)
+}
+
+/// Conic (angular / "sweep") gradient, emitted as an exact Type 1
+/// function-based shading (ISO 32000-1 §8.7.4.5.2) whose `/Function` is a real
+/// Type 4 PostScript calculator: the colour is a resolution-independent
+/// function of the angle around `center`, not a piecewise mesh approximation.
+///
+/// Marked `#[non_exhaustive]`: build via [`ConicShading::new`] /
+/// [`with_matrix`](ConicShading::with_matrix) so future additive fields stay
+/// non-breaking.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConicShading {
+    /// Shading name for referencing.
+    pub name: String,
+    /// Centre of the angular sweep, in the shading's domain coordinates.
+    pub center: Point,
+    /// Domain `[xmin xmax ymin ymax]` the function is evaluated over.
+    pub domain: [f64; 4],
+    /// Optional matrix mapping domain space to the shading target space.
+    pub matrix: Option<[f64; 6]>,
+    /// Colour stops swept from angle 0 (t=0) to a full turn (t=1).
+    pub color_stops: Vec<ColorStop>,
+}
+
+impl ConicShading {
+    /// Create a conic gradient centred at `center` over `domain`.
+    pub fn new(
+        name: impl Into<String>,
+        center: Point,
+        domain: [f64; 4],
+        color_stops: Vec<ColorStop>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            center,
+            domain,
+            matrix: None,
+            color_stops,
+        }
+    }
+
+    /// Set the shading-to-target transformation matrix.
+    pub fn with_matrix(mut self, matrix: [f64; 6]) -> Self {
+        self.matrix = Some(matrix);
+        self
+    }
+
+    /// Validate stops (non-empty, ascending) and domain (min < max).
+    pub fn validate(&self) -> Result<()> {
+        if self.color_stops.is_empty() {
+            return Err(PdfError::InvalidStructure(
+                "Conic shading must have at least one color stop".to_string(),
+            ));
+        }
+        if self.domain[0] >= self.domain[1] || self.domain[2] >= self.domain[3] {
+            return Err(PdfError::InvalidStructure(
+                "Invalid domain: min values must be less than max values".to_string(),
+            ));
+        }
+        for window in self.color_stops.windows(2) {
+            if window[0].position > window[1].position {
+                return Err(PdfError::InvalidStructure(
+                    "Color stops must be in ascending order".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the Type 1 function-based shading dictionary with a real Type 4
+    /// PostScript `/Function` (angle prologue + colour ramp) and the required
+    /// `/ColorSpace`. The `/Function` is inlined as a stream; the writer hoists
+    /// it to an indirect object (a stream cannot be a dictionary value).
+    pub fn to_pdf_dictionary(&self) -> Result<Dictionary> {
+        self.validate()?;
+        let space = resolve_color_space(&self.color_stops);
+        let code = format!(
+            "{{ {} {} }}",
+            build_conic_angle_prologue(self.center),
+            build_color_ramp_ps(&self.color_stops, space)
+        );
+        let range: Vec<f64> = (0..n_components(space)).flat_map(|_| [0.0, 1.0]).collect();
+        let (fdict, fbytes) = postscript_type4_function(&code, &self.domain, &range);
+
+        let mut dict = Dictionary::new();
+        dict.set(
+            "ShadingType",
+            Object::Integer(ShadingType::FunctionBased as i64),
+        );
+        dict.set("ColorSpace", Object::Name(space.to_string()));
+        dict.set(
+            "Domain",
+            Object::Array(self.domain.iter().map(|&d| Object::Real(d)).collect()),
+        );
+        dict.set("Function", Object::Stream(fdict, fbytes));
+        if let Some(matrix) = self.matrix {
+            dict.set(
+                "Matrix",
+                Object::Array(matrix.iter().map(|&v| Object::Real(v)).collect()),
+            );
+        }
+        Ok(dict)
+    }
+}
+
 /// Coordinate point for shading definitions
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -1296,6 +1495,162 @@ mod tests {
                 0x01, 0xE6, 0x66, 0x19, 0x9A, 0x00, 0x00, 0xFF,
             ]
         );
+    }
+
+    // ── Issue #407 Track B: Type 1 conic (PostScript Type 4 function) ──
+
+    #[test]
+    fn test_postscript_type4_function_shape() {
+        // Wraps arbitrary calculator code with FunctionType 4 + Domain/Range;
+        // the code bytes are stored verbatim (no transformation).
+        let (dict, code) = postscript_type4_function(
+            "{ 1 }",
+            &[0.0, 1.0, 0.0, 1.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        );
+        assert_eq!(dict.get("FunctionType"), Some(&Object::Integer(4)));
+        assert_eq!(
+            dict.get("Domain"),
+            Some(&Object::Array(
+                vec![0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        assert_eq!(
+            dict.get("Range"),
+            Some(&Object::Array(
+                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        assert_eq!(code, b"{ 1 }");
+    }
+
+    #[test]
+    fn test_color_ramp_ps_two_stops_no_branching() {
+        // 2 stops → straight per-component linear interpolation of a local t on
+        // the stack, no ifelse. red→blue over DeviceRGB: deltas (-1, 0, 1).
+        let stops = vec![
+            ColorStop::new(0.0, Color::Rgb(1.0, 0.0, 0.0)),
+            ColorStop::new(1.0, Color::Rgb(0.0, 0.0, 1.0)),
+        ];
+        let ps = build_color_ramp_ps(&stops, "DeviceRGB");
+        assert_eq!(ps, "dup -1 mul 1 add exch dup 0 mul 0 add exch 1 mul 0 add");
+        assert!(!ps.contains("ifelse"));
+    }
+
+    #[test]
+    fn test_color_ramp_ps_three_stops_has_bound_check() {
+        // 3 stops → one ifelse splitting at the interior stop (0.5), two
+        // interpolation segments (3 muls each over DeviceRGB → 6 total).
+        let stops = vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(0.5, Color::green()),
+            ColorStop::new(1.0, Color::blue()),
+        ];
+        let ps = build_color_ramp_ps(&stops, "DeviceRGB");
+        assert_eq!(ps.matches("ifelse").count(), 1, "one split for three stops");
+        assert!(ps.contains("0.5"), "interior bound present");
+        assert_eq!(ps.matches("mul").count(), 6, "two RGB segments");
+    }
+
+    #[test]
+    fn test_conic_angle_prologue_exact_ps() {
+        // stack in: x y. dy=y-cy, dx=x-cx, angle=atan2(dy,dx), t=angle/360.
+        let ps = build_conic_angle_prologue(Point::new(50.0, 50.0));
+        assert_eq!(ps, "50 sub exch 50 sub atan 360 div");
+    }
+
+    #[test]
+    fn test_conic_shading_emits_type1_with_ps_function_and_colorspace() {
+        let stops = vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(1.0, Color::blue()),
+        ];
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(50.0, 50.0),
+            [0.0, 100.0, 0.0, 100.0],
+            stops.clone(),
+        );
+        let dict = conic.to_pdf_dictionary().unwrap();
+
+        // Function-based (Type 1) shading with the required ColorSpace + Domain.
+        assert_eq!(dict.get("ShadingType"), Some(&Object::Integer(1)));
+        assert_eq!(
+            dict.get("ColorSpace"),
+            Some(&Object::Name("DeviceRGB".to_string()))
+        );
+        assert_eq!(
+            dict.get("Domain"),
+            Some(&Object::Array(
+                vec![0.0, 100.0, 0.0, 100.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+
+        // /Function is a real Type 4 PostScript stream, not a placeholder.
+        let (fdict, fcode) = match dict.get("Function") {
+            Some(Object::Stream(d, c)) => (d, c),
+            other => panic!("Function must be a Type 4 stream, got {other:?}"),
+        };
+        assert_eq!(fdict.get("FunctionType"), Some(&Object::Integer(4)));
+        // Function domain == shading domain (2 inputs x, y).
+        assert_eq!(
+            fdict.get("Domain"),
+            Some(&Object::Array(
+                vec![0.0, 100.0, 0.0, 100.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        // Range == n_components pairs of [0, 1] (3 for RGB).
+        assert_eq!(
+            fdict.get("Range"),
+            Some(&Object::Array(
+                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        // Program == "{ <angle prologue> <colour ramp> }".
+        let expected = format!(
+            "{{ {} {} }}",
+            build_conic_angle_prologue(Point::new(50.0, 50.0)),
+            build_color_ramp_ps(&stops, "DeviceRGB")
+        );
+        assert_eq!(fcode, &expected.into_bytes());
+    }
+
+    #[test]
+    fn test_conic_shading_validate_rejects_bad_domain_and_empty_stops() {
+        let stops = vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(1.0, Color::blue()),
+        ];
+        let bad_domain = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [1.0, 0.0, 0.0, 1.0], // xmin > xmax
+            stops,
+        );
+        assert!(bad_domain.validate().is_err());
+
+        let empty = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [0.0, 1.0, 0.0, 1.0],
+            vec![],
+        );
+        assert!(empty.validate().is_err());
     }
 
     #[test]
