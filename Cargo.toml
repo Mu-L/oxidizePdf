@@ -69,7 +69,9 @@ regex = "1.11"
 # Pro dependencies
 base64 = "0.21"
 uuid = { version = "1.0", features = ["v4"] }
-quick-xml = { version = "0.39", features = ["serialize"] }
+# XMP metadata parsing uses only the streaming pull-parser (Reader/Event); the
+# `serialize` (serde) feature was enabled but never used. See issue #416.
+quick-xml = { version = "0.39" }
 reqwest = { version = "0.11", features = ["json"] }
 
 [profile.release]

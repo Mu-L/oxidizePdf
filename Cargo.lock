@@ -1598,6 +1598,7 @@ dependencies = [
  "unicode-normalization",
  "ureq",
  "webpki-roots 1.0.7",
+ "weezl",
  "whatlang",
  "winapi",
  "x509-cert",
@@ -1863,7 +1864,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
- "serde",
 ]
 
 [[package]]
