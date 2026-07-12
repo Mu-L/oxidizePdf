@@ -206,6 +206,280 @@ fn assemble_gradient_dict(
     Ok(dict)
 }
 
+/// MSB-first bit packer for Type 4 mesh vertex streams (ISO 32000-1
+/// §8.7.4.5.5). Coordinate/component/flag values are written most-significant-
+/// bit first; each vertex is padded to a byte boundary via [`align_to_byte`].
+struct BitWriter {
+    buffer: Vec<u8>,
+    current_byte: u8,
+    bits_filled: u8,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            current_byte: 0,
+            bits_filled: 0,
+        }
+    }
+
+    /// Append the low `bits` bits of `value`, most-significant-bit first.
+    fn write_bits(&mut self, value: u64, bits: u8) {
+        for i in (0..bits).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.current_byte = (self.current_byte << 1) | bit;
+            self.bits_filled += 1;
+            if self.bits_filled == 8 {
+                self.buffer.push(self.current_byte);
+                self.current_byte = 0;
+                self.bits_filled = 0;
+            }
+        }
+    }
+
+    /// Zero-pad any partial byte up to the next byte boundary.
+    fn align_to_byte(&mut self) {
+        if self.bits_filled > 0 {
+            self.current_byte <<= 8 - self.bits_filled;
+            self.buffer.push(self.current_byte);
+            self.current_byte = 0;
+            self.bits_filled = 0;
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+}
+
+/// Map a real `value` in `[min, max]` to an unsigned integer of `bits` width
+/// for a Type 4 mesh vertex stream (ISO 32000-1 §8.7.4.5.5, `/Decode`). The
+/// value is clamped to the range, normalised to `[0, 1]`, then scaled to
+/// `2^bits - 1` with round-half-away-from-zero (Rust `f64::round`).
+fn encode_value(value: f64, min: f64, max: f64, bits: u8) -> u64 {
+    let span = max - min;
+    let frac = if span == 0.0 {
+        0.0
+    } else {
+        ((value.clamp(min, max) - min) / span).clamp(0.0, 1.0)
+    };
+    let max_int = (1u64 << bits) - 1;
+    (frac * max_int as f64).round() as u64
+}
+
+/// A single vertex of a Type 4 free-form Gouraud-shaded triangle mesh
+/// (ISO 32000-1 §8.7.4.5.5). `flag` is the edge flag (0 starts a new
+/// triangle; 1 and 2 share an edge with the previous triangle).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GouraudVertex {
+    /// Edge flag (0, 1, or 2).
+    pub flag: u8,
+    /// X coordinate in shading space.
+    pub x: f64,
+    /// Y coordinate in shading space.
+    pub y: f64,
+    /// Vertex colour.
+    pub color: Color,
+}
+
+/// Pack one mesh vertex into its byte-aligned binary form (ISO 32000-1
+/// §8.7.4.5.5): edge flag, then x, y, then colour components, each written at
+/// its declared bit width via [`BitWriter`] with coordinates/components mapped
+/// through `decode`. Each vertex's data is an integral number of bytes.
+fn pack_vertex(
+    vertex: &GouraudVertex,
+    bits_per_flag: u8,
+    bits_per_coordinate: u8,
+    bits_per_component: u8,
+    decode: &[f64],
+    color_space: &str,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write_bits(vertex.flag as u64, bits_per_flag);
+    w.write_bits(
+        encode_value(vertex.x, decode[0], decode[1], bits_per_coordinate),
+        bits_per_coordinate,
+    );
+    w.write_bits(
+        encode_value(vertex.y, decode[2], decode[3], bits_per_coordinate),
+        bits_per_coordinate,
+    );
+    for (i, comp) in color_components(&vertex.color, color_space)
+        .into_iter()
+        .enumerate()
+    {
+        let lo = decode[4 + 2 * i];
+        let hi = decode[4 + 2 * i + 1];
+        w.write_bits(
+            encode_value(comp, lo, hi, bits_per_component),
+            bits_per_component,
+        );
+    }
+    w.align_to_byte();
+    w.into_bytes()
+}
+
+/// Number of colour components for a device colour space name (used to size
+/// the `/Decode` array and validate mesh vertex colours).
+fn n_components(color_space: &str) -> usize {
+    match color_space {
+        "DeviceGray" => 1,
+        "DeviceCMYK" => 4,
+        // DeviceRGB and any unexpected name default to 3-component RGB.
+        _ => 3,
+    }
+}
+
+/// Free-form Gouraud-shaded triangle mesh (Type 4 shading, ISO 32000-1
+/// §8.7.4.5.5). Emitted as a PDF stream: the shading dictionary plus a binary
+/// body of packed vertex data. Construct with [`FreeFormGouraudShading::new`]
+/// (defaulting to 16-bit coordinates and 8-bit components/flags) and adjust the
+/// bit widths with [`with_bits`](FreeFormGouraudShading::with_bits).
+///
+/// Marked `#[non_exhaustive]`: future additive fields (e.g. an optional
+/// `/Function` over the vertices) must not break external construction, so
+/// build via `new`/`with_bits` rather than a struct literal across crates.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FreeFormGouraudShading {
+    /// Shading name for referencing.
+    pub name: String,
+    /// Device colour space name (`DeviceGray`/`DeviceRGB`/`DeviceCMYK`).
+    pub color_space: String,
+    /// Bits per coordinate (∈ {1,2,4,8,12,16,24,32}).
+    pub bits_per_coordinate: u8,
+    /// Bits per colour component (∈ {1,2,4,8,12,16}).
+    pub bits_per_component: u8,
+    /// Bits per edge flag (∈ {2,4,8}).
+    pub bits_per_flag: u8,
+    /// Decode array `[xmin xmax ymin ymax c1min c1max …]` (§8.7.4.5.5).
+    pub decode: Vec<f64>,
+    /// Mesh vertices in emission order.
+    pub vertices: Vec<GouraudVertex>,
+}
+
+impl FreeFormGouraudShading {
+    /// Create a mesh shading with default bit widths (16-bit coordinates,
+    /// 8-bit components, 8-bit flags). `decode` must have
+    /// `4 + 2 * n_components(color_space)` entries.
+    pub fn new(
+        name: impl Into<String>,
+        color_space: impl Into<String>,
+        decode: Vec<f64>,
+        vertices: Vec<GouraudVertex>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            color_space: color_space.into(),
+            bits_per_coordinate: 16,
+            bits_per_component: 8,
+            bits_per_flag: 8,
+            decode,
+            vertices,
+        }
+    }
+
+    /// Override the packed bit widths.
+    pub fn with_bits(
+        mut self,
+        bits_per_coordinate: u8,
+        bits_per_component: u8,
+        bits_per_flag: u8,
+    ) -> Self {
+        self.bits_per_coordinate = bits_per_coordinate;
+        self.bits_per_component = bits_per_component;
+        self.bits_per_flag = bits_per_flag;
+        self
+    }
+
+    /// Validate the mesh against the Type 4 constraints (ISO 32000-1
+    /// §8.7.4.5.5): permitted bit widths, `/Decode` length matching the colour
+    /// space, at least one vertex, and a leading edge flag of 0.
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.bits_per_coordinate, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+            return Err(PdfError::InvalidStructure(format!(
+                "BitsPerCoordinate must be 1,2,4,8,12,16,24 or 32, got {}",
+                self.bits_per_coordinate
+            )));
+        }
+        if !matches!(self.bits_per_component, 1 | 2 | 4 | 8 | 12 | 16) {
+            return Err(PdfError::InvalidStructure(format!(
+                "BitsPerComponent must be 1,2,4,8,12 or 16, got {}",
+                self.bits_per_component
+            )));
+        }
+        if !matches!(self.bits_per_flag, 2 | 4 | 8) {
+            return Err(PdfError::InvalidStructure(format!(
+                "BitsPerFlag must be 2, 4 or 8, got {}",
+                self.bits_per_flag
+            )));
+        }
+        let expected = 4 + 2 * n_components(&self.color_space);
+        if self.decode.len() != expected {
+            return Err(PdfError::InvalidStructure(format!(
+                "Decode must have {} entries for {}, got {}",
+                expected,
+                self.color_space,
+                self.decode.len()
+            )));
+        }
+        if self.vertices.is_empty() {
+            return Err(PdfError::InvalidStructure(
+                "Mesh shading must have at least one vertex".to_string(),
+            ));
+        }
+        if self.vertices[0].flag != 0 {
+            return Err(PdfError::InvalidStructure(
+                "First mesh vertex must have edge flag 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the Type 4 shading as a PDF stream object: the shading dictionary
+    /// plus the byte-aligned packed vertex data. A mesh cannot be inlined as a
+    /// plain dictionary, so this is the emission entry point (the writer hoists
+    /// it to an indirect object).
+    pub fn to_pdf_object(&self) -> Result<Object> {
+        self.validate()?;
+
+        let mut dict = Dictionary::new();
+        dict.set(
+            "ShadingType",
+            Object::Integer(ShadingType::FreeFormGouraud as i64),
+        );
+        dict.set("ColorSpace", Object::Name(self.color_space.clone()));
+        dict.set(
+            "BitsPerCoordinate",
+            Object::Integer(self.bits_per_coordinate as i64),
+        );
+        dict.set(
+            "BitsPerComponent",
+            Object::Integer(self.bits_per_component as i64),
+        );
+        dict.set("BitsPerFlag", Object::Integer(self.bits_per_flag as i64));
+        dict.set(
+            "Decode",
+            Object::Array(self.decode.iter().map(|&d| Object::Real(d)).collect()),
+        );
+
+        let mut data = Vec::new();
+        for v in &self.vertices {
+            data.extend(pack_vertex(
+                v,
+                self.bits_per_flag,
+                self.bits_per_coordinate,
+                self.bits_per_component,
+                &self.decode,
+                &self.color_space,
+            ));
+        }
+
+        Ok(Object::Stream(dict, data))
+    }
+}
+
 /// Coordinate point for shading definitions
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -819,6 +1093,210 @@ impl ShadingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Issue #407 Track A: BitWriter (MSB-first packing for mesh vertex data) ──
+
+    #[test]
+    fn test_bitwriter_single_value_byte_aligned() {
+        // 4 bits 0b1011 then pad to a byte → 0b1011_0000.
+        let mut w = BitWriter::new();
+        w.write_bits(0b1011, 4);
+        w.align_to_byte();
+        assert_eq!(w.into_bytes(), vec![0xB0]);
+    }
+
+    #[test]
+    fn test_bitwriter_value_spans_two_bytes() {
+        // 9-bit value 0x1FF crosses the byte boundary: 1111_1111 | 1___ then pad.
+        let mut w = BitWriter::new();
+        w.write_bits(0b1_1111_1111, 9);
+        w.align_to_byte();
+        assert_eq!(w.into_bytes(), vec![0xFF, 0x80]);
+    }
+
+    #[test]
+    fn test_bitwriter_accumulates_across_writes() {
+        // 0b10 then 0b110 → 0b10110, padded to 0b1011_0000.
+        let mut w = BitWriter::new();
+        w.write_bits(0b10, 2);
+        w.write_bits(0b110, 3);
+        w.align_to_byte();
+        assert_eq!(w.into_bytes(), vec![0xB0]);
+    }
+
+    #[test]
+    fn test_encode_value_maps_real_to_packed_integer() {
+        // 50 in [0,100] over 8 bits → 0.5 * 255 = 127.5 → round half away → 128.
+        assert_eq!(encode_value(50.0, 0.0, 100.0, 8), 128);
+    }
+
+    #[test]
+    fn test_encode_value_clamps_out_of_range() {
+        assert_eq!(encode_value(150.0, 0.0, 100.0, 8), 255);
+        assert_eq!(encode_value(-10.0, 0.0, 100.0, 8), 0);
+        assert_eq!(encode_value(100.0, 0.0, 100.0, 8), 255);
+    }
+
+    #[test]
+    fn test_encode_value_16_bit_precision() {
+        // 0.5 in [0,1] over 16 bits → 0.5 * 65535 = 32767.5 → round half away → 32768.
+        assert_eq!(encode_value(0.5, 0.0, 1.0, 16), 32768);
+    }
+
+    #[test]
+    fn test_gouraud_vertex_pack_byte_aligned() {
+        // flag(8) + x,y(16 each) + 3 rgb components(8 each) = 64 bits = 8 bytes.
+        let v = GouraudVertex {
+            flag: 0,
+            x: 10.0,
+            y: 20.0,
+            color: Color::Rgb(1.0, 0.0, 0.0),
+        };
+        let decode = [0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let bytes = pack_vertex(&v, 8, 16, 8, &decode, "DeviceRGB");
+        // x=10→0.1*65535=6554=0x199A, y=20→0x3333, r=255,g=0,b=0.
+        assert_eq!(bytes, vec![0x00, 0x19, 0x9A, 0x33, 0x33, 0xFF, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_gouraud_vertex_pack_with_padding() {
+        // flag(2) + x,y(8 each) + 1 gray component(8) = 26 bits → 4 bytes (6 pad).
+        let v = GouraudVertex {
+            flag: 1,
+            x: 50.0,
+            y: 25.0,
+            color: Color::Gray(0.5),
+        };
+        let decode = [0.0, 100.0, 0.0, 100.0, 0.0, 1.0];
+        let bytes = pack_vertex(&v, 2, 8, 8, &decode, "DeviceGray");
+        // flag=01, x=128=0x80, y=64=0x40, gray=128=0x80 → 01 10000000 01000000 10000000.
+        assert_eq!(bytes, vec![0x60, 0x10, 0x20, 0x00]);
+    }
+
+    /// Three valid RGB vertices for the mesh-level tests (flags 0,1,1).
+    fn sample_rgb_mesh() -> FreeFormGouraudShading {
+        FreeFormGouraudShading::new(
+            "M".to_string(),
+            "DeviceRGB".to_string(),
+            vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            vec![
+                GouraudVertex {
+                    flag: 0,
+                    x: 10.0,
+                    y: 20.0,
+                    color: Color::Rgb(1.0, 0.0, 0.0),
+                },
+                GouraudVertex {
+                    flag: 1,
+                    x: 50.0,
+                    y: 50.0,
+                    color: Color::Rgb(0.0, 1.0, 0.0),
+                },
+                GouraudVertex {
+                    flag: 1,
+                    x: 90.0,
+                    y: 10.0,
+                    color: Color::Rgb(0.0, 0.0, 1.0),
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn test_freeform_gouraud_creation_defaults() {
+        let mesh = sample_rgb_mesh();
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.name, "M");
+        assert_eq!(mesh.color_space, "DeviceRGB");
+        // new() defaults: 16-bit coords, 8-bit components, 8-bit flags.
+        assert_eq!(mesh.bits_per_coordinate, 16);
+        assert_eq!(mesh.bits_per_component, 8);
+        assert_eq!(mesh.bits_per_flag, 8);
+        assert_eq!(mesh.vertices.len(), 3);
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_invalid_bits() {
+        let mut m = sample_rgb_mesh();
+        m.bits_per_coordinate = 5; // not in {1,2,4,8,12,16,24,32}
+        assert!(m.validate().is_err());
+
+        let mut m = sample_rgb_mesh();
+        m.bits_per_component = 3; // not in {1,2,4,8,12,16}
+        assert!(m.validate().is_err());
+
+        let mut m = sample_rgb_mesh();
+        m.bits_per_flag = 3; // not in {2,4,8}
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_decode_length_mismatch() {
+        let mut m = sample_rgb_mesh();
+        // DeviceRGB needs 4 + 2*3 = 10 entries; give 8.
+        m.decode = vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_empty_vertices() {
+        let mut m = sample_rgb_mesh();
+        m.vertices.clear();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_nonzero_first_flag() {
+        let mut m = sample_rgb_mesh();
+        m.vertices[0].flag = 1;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_to_pdf_object_dict_keys() {
+        let obj = sample_rgb_mesh().to_pdf_object().unwrap();
+        let dict = match &obj {
+            Object::Stream(d, _) => d,
+            other => panic!("mesh must emit a Stream, got {other:?}"),
+        };
+        assert_eq!(dict.get("ShadingType"), Some(&Object::Integer(4)));
+        assert_eq!(
+            dict.get("ColorSpace"),
+            Some(&Object::Name("DeviceRGB".to_string()))
+        );
+        assert_eq!(dict.get("BitsPerCoordinate"), Some(&Object::Integer(16)));
+        assert_eq!(dict.get("BitsPerComponent"), Some(&Object::Integer(8)));
+        assert_eq!(dict.get("BitsPerFlag"), Some(&Object::Integer(8)));
+        assert_eq!(
+            dict.get("Decode"),
+            Some(&Object::Array(
+                vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_freeform_gouraud_stream_body_exact_bytes() {
+        let obj = sample_rgb_mesh().to_pdf_object().unwrap();
+        let data = match &obj {
+            Object::Stream(_, d) => d,
+            other => panic!("mesh must emit a Stream, got {other:?}"),
+        };
+        assert_eq!(
+            *data,
+            vec![
+                // v0: flag0, x10, y20, red
+                0x00, 0x19, 0x9A, 0x33, 0x33, 0xFF, 0x00, 0x00, //
+                // v1: flag1, x50, y50, green
+                0x01, 0x80, 0x00, 0x80, 0x00, 0x00, 0xFF, 0x00, //
+                // v2: flag1, x90, y10, blue
+                0x01, 0xE6, 0x66, 0x19, 0x9A, 0x00, 0x00, 0xFF,
+            ]
+        );
+    }
 
     #[test]
     fn test_color_stop_creation() {

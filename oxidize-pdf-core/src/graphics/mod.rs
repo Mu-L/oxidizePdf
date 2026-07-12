@@ -44,8 +44,8 @@ pub use separation_color::{
     AlternateColorSpace, SeparationColor, SeparationColorSpace, SpotColors, TintTransform,
 };
 pub use shadings::{
-    AxialShading, ColorStop, FunctionBasedShading, Point, RadialShading, ShadingDefinition,
-    ShadingManager, ShadingPattern, ShadingType,
+    AxialShading, ColorStop, FreeFormGouraudShading, FunctionBasedShading, GouraudVertex, Point,
+    RadialShading, ShadingDefinition, ShadingManager, ShadingPattern, ShadingType,
 };
 pub use soft_mask::{SoftMask, SoftMaskState, SoftMaskType};
 pub use state::{
