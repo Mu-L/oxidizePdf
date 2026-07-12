@@ -679,6 +679,31 @@ impl ConicShading {
     }
 }
 
+/// Internal wrapper for the additive shading types (Type 4 mesh, Type 1 conic)
+/// registered via [`Page::add_mesh_shading`](crate::Page::add_mesh_shading) and
+/// [`Page::add_conic_shading`](crate::Page::add_conic_shading). Kept in a
+/// separate page collection from [`ShadingDefinition`] so the public gradient
+/// enum stays unchanged (folding these in is a 5.0.0 breaking-bundle item).
+#[derive(Debug, Clone)]
+pub(crate) enum AdvancedShading {
+    /// Type 4 free-form Gouraud mesh (emitted as a stream).
+    Mesh(FreeFormGouraudShading),
+    /// Type 1 conic gradient (emitted as a dictionary with a `/Function`
+    /// stream the writer hoists).
+    Conic(ConicShading),
+}
+
+impl AdvancedShading {
+    /// Emit the shading as a PDF object: a stream for the mesh, a dictionary
+    /// for the conic.
+    pub(crate) fn to_pdf_object(&self) -> Result<Object> {
+        match self {
+            AdvancedShading::Mesh(m) => m.to_pdf_object(),
+            AdvancedShading::Conic(c) => Ok(Object::Dictionary(c.to_pdf_dictionary()?)),
+        }
+    }
+}
+
 /// Coordinate point for shading definitions
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
