@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+## [4.0.1] - 2026-07-12
+
+### Fixed
+
+- **Indirect `/Kids` and `/Count` page trees now parse** (#415). A `/Pages` node
+  that stores `/Kids` or `/Count` as an indirect reference (`N G R`) instead of
+  inline — spec-legal per ISO 32000-1 §7.3.10, emitted by iText — made
+  `page_count()` return 0 and `extract_text()` return empty text with no error.
+  One level of indirection is now resolved consistently across the page-tree
+  flat index, `PdfReader::page_count()`, and PDF/A page-walk validation.
+- **LZW `EarlyChange` code-width boundary** (#415). The decoder widened the code
+  one entry too late (`2^width` instead of `2^width - 1` under the default
+  `EarlyChange=1`), desyncing streams that grew past 511/1023/2047 dictionary
+  entries and failing with `invalid code`. Corrected per ISO 32000-1 §7.4.4.2.
+
+### Security
+
+- Bumped `quick-xml` 0.39 → 0.41 to clear **RUSTSEC-2026-0194** and
+  **RUSTSEC-2026-0195** — DoS advisories (quadratic duplicate-attribute check;
+  unbounded namespace-declaration allocation) reachable through untrusted XMP
+  metadata. Also dropped its unused `serialize` (serde) feature; XMP parsing
+  uses only the streaming pull-parser (#416).
+
 ## [4.0.0] - 2026-07-10
 
 ### BREAKING CHANGES

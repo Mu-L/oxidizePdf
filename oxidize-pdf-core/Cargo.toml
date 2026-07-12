@@ -111,6 +111,11 @@ rusty-tesseract = { version = "1.1.10", optional = true }
 # leptonica-plumbing = { version = "1.0", optional = true }
 
 [dev-dependencies]
+# Trusted TIFF/PDF (early-change) LZW codec, used only to encode boundary-
+# crossing fixtures for the LZW decoder regression tests. Also pulled in
+# transitively under --all-features (image/tiff/gif); pinned to the resolved
+# version.
+weezl = "0.1.12"
 criterion = { version = "0.8", features = ["html_reports"] }
 flate2 = { workspace = true }
 proptest = { workspace = true }

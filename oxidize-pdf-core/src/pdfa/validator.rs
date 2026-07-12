@@ -504,10 +504,10 @@ impl PdfAValidator {
             .map_err(|e| PdfAError::ParseError(e.to_string()))?
             .clone();
 
-        // Get Kids array
-        let kids = pages_dict
-            .get("Kids")
-            .and_then(|k| k.as_array())
+        // Get Kids array, resolving a single level of indirection: ISO 32000-1
+        // §7.3.10 permits `/Kids N G R` (iText 5.5.9 emits this), and a bare
+        // `as_array()` would silently reject it (issue #415).
+        let kids = crate::parser::reader::resolve_to_array(reader, pages_dict.get("Kids"))
             .ok_or_else(|| PdfAError::ParseError("Pages missing Kids array".to_string()))?;
 
         // Get page reference
