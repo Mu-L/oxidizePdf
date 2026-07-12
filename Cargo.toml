@@ -70,8 +70,10 @@ regex = "1.11"
 base64 = "0.21"
 uuid = { version = "1.0", features = ["v4"] }
 # XMP metadata parsing uses only the streaming pull-parser (Reader/Event); the
-# `serialize` (serde) feature was enabled but never used. See issue #416.
-quick-xml = { version = "0.39" }
+# `serialize` (serde) feature was enabled but never used. Pinned >= 0.41 to
+# clear RUSTSEC-2026-0194/0195 (DoS in NsReader / duplicate-attribute check).
+# See issue #416.
+quick-xml = { version = "0.41" }
 reqwest = { version = "0.11", features = ["json"] }
 
 [profile.release]

@@ -21,10 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EarlyChange=1`), desyncing streams that grew past 511/1023/2047 dictionary
   entries and failing with `invalid code`. Corrected per ISO 32000-1 §7.4.4.2.
 
-### Changed
+### Security
 
-- Dropped the unused `serialize` (serde) feature from the `quick-xml` dependency;
-  XMP metadata parsing only uses the streaming pull-parser (#416).
+- Bumped `quick-xml` 0.39 → 0.41 to clear **RUSTSEC-2026-0194** and
+  **RUSTSEC-2026-0195** — DoS advisories (quadratic duplicate-attribute check;
+  unbounded namespace-declaration allocation) reachable through untrusted XMP
+  metadata. Also dropped its unused `serialize` (serde) feature; XMP parsing
+  uses only the streaming pull-parser (#416).
 
 ## [4.0.0] - 2026-07-10
 
