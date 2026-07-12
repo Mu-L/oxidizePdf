@@ -126,6 +126,10 @@ pub struct Page {
     /// Registered shadings, emitted as indirect dictionary objects
     /// referenced from `/Resources/Shading` per ISO 32000-1 §8.7.4.
     shadings: HashMap<String, crate::graphics::ShadingDefinition>,
+    /// Registered mesh (Type 4) and conic (Type 1) shadings, emitted into the
+    /// same `/Resources/Shading` dict as `shadings` but kept in a separate map
+    /// so the public `ShadingDefinition` enum stays unchanged (#407).
+    advanced_shadings: HashMap<String, crate::graphics::AdvancedShading>,
     header: Option<HeaderFooter>,
     footer: Option<HeaderFooter>,
     annotations: Vec<Annotation>,
@@ -177,6 +181,7 @@ impl Page {
             color_spaces: HashMap::new(),
             patterns: HashMap::new(),
             shadings: HashMap::new(),
+            advanced_shadings: HashMap::new(),
             header: None,
             footer: None,
             annotations: Vec::new(),
@@ -1300,6 +1305,53 @@ impl Page {
     /// Returns all shadings registered on this page.
     pub fn shadings(&self) -> &HashMap<String, crate::graphics::ShadingDefinition> {
         &self.shadings
+    }
+
+    /// Register a Type 4 free-form Gouraud mesh shading (#407), referenced
+    /// from `/Resources/Shading/<name>` and painted with `/<name> sh`. The
+    /// mesh is emitted as a stream object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdfError::InvalidStructure`] if `name` is not a valid PDF
+    /// resource name (ISO 32000-1 §7.3.5) or the mesh fails validation.
+    pub fn add_mesh_shading(
+        &mut self,
+        name: impl Into<String>,
+        shading: crate::graphics::FreeFormGouraudShading,
+    ) -> Result<()> {
+        let name = name.into();
+        validate_pdf_resource_name(&name)?;
+        shading.validate()?;
+        self.advanced_shadings
+            .insert(name, crate::graphics::AdvancedShading::Mesh(shading));
+        Ok(())
+    }
+
+    /// Register an exact conic (angular) gradient as a Type 1 function-based
+    /// shading (#407), referenced from `/Resources/Shading/<name>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PdfError::InvalidStructure`] if `name` is not a valid PDF
+    /// resource name (ISO 32000-1 §7.3.5) or the shading fails validation.
+    pub fn add_conic_shading(
+        &mut self,
+        name: impl Into<String>,
+        shading: crate::graphics::ConicShading,
+    ) -> Result<()> {
+        let name = name.into();
+        validate_pdf_resource_name(&name)?;
+        shading.validate()?;
+        self.advanced_shadings
+            .insert(name, crate::graphics::AdvancedShading::Conic(shading));
+        Ok(())
+    }
+
+    /// Returns the mesh/conic shadings registered on this page (crate-internal;
+    /// consumed by the writer).
+    pub(crate) fn advanced_shadings(&self) -> &HashMap<String, crate::graphics::AdvancedShading> {
+        &self.advanced_shadings
     }
 
     /// Append raw PDF operators to the content stream and record which

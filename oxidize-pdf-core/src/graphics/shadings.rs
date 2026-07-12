@@ -87,6 +87,9 @@ fn color_components(color: &Color, space: &str) -> Vec<f64> {
             vec![c, m, y, k]
         }
         // DeviceRGB (and any unexpected name) → exact RGB conversion.
+        // Invariant: `Color::to_rgb` (color.rs) always returns `Color::Rgb`. If
+        // a future `Color` variant changes that, update this arm — the compiler
+        // will not flag it here.
         _ => match color.to_rgb() {
             Color::Rgb(r, g, b) => vec![r, g, b],
             _ => unreachable!("to_rgb always yields Color::Rgb"),
@@ -204,6 +207,550 @@ fn assemble_gradient_dict(
         ]),
     );
     Ok(dict)
+}
+
+/// MSB-first bit packer for Type 4 mesh vertex streams (ISO 32000-1
+/// §8.7.4.5.5). Coordinate/component/flag values are written most-significant-
+/// bit first; each vertex is padded to a byte boundary via [`align_to_byte`].
+struct BitWriter {
+    buffer: Vec<u8>,
+    current_byte: u8,
+    bits_filled: u8,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            current_byte: 0,
+            bits_filled: 0,
+        }
+    }
+
+    /// Append the low `bits` bits of `value`, most-significant-bit first.
+    fn write_bits(&mut self, value: u64, bits: u8) {
+        for i in (0..bits).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.current_byte = (self.current_byte << 1) | bit;
+            self.bits_filled += 1;
+            if self.bits_filled == 8 {
+                self.buffer.push(self.current_byte);
+                self.current_byte = 0;
+                self.bits_filled = 0;
+            }
+        }
+    }
+
+    /// Zero-pad any partial byte up to the next byte boundary.
+    fn align_to_byte(&mut self) {
+        if self.bits_filled > 0 {
+            self.current_byte <<= 8 - self.bits_filled;
+            self.buffer.push(self.current_byte);
+            self.current_byte = 0;
+            self.bits_filled = 0;
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+}
+
+/// Map a real `value` in `[min, max]` to an unsigned integer of `bits` width
+/// for a Type 4 mesh vertex stream (ISO 32000-1 §8.7.4.5.5, `/Decode`). The
+/// value is clamped to the range, normalised to `[0, 1]`, then scaled to
+/// `2^bits - 1` with round-half-away-from-zero (Rust `f64::round`).
+fn encode_value(value: f64, min: f64, max: f64, bits: u8) -> u64 {
+    let span = max - min;
+    let frac = if span == 0.0 {
+        0.0
+    } else {
+        ((value.clamp(min, max) - min) / span).clamp(0.0, 1.0)
+    };
+    let max_int = (1u64 << bits) - 1;
+    (frac * max_int as f64).round() as u64
+}
+
+/// A single vertex of a Type 4 free-form Gouraud-shaded triangle mesh
+/// (ISO 32000-1 §8.7.4.5.5). `flag` is the edge flag (0 starts a new
+/// triangle; 1 and 2 share an edge with the previous triangle).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GouraudVertex {
+    /// Edge flag (0, 1, or 2).
+    pub flag: u8,
+    /// X coordinate in shading space.
+    pub x: f64,
+    /// Y coordinate in shading space.
+    pub y: f64,
+    /// Vertex colour.
+    pub color: Color,
+}
+
+/// Pack one mesh vertex into its byte-aligned binary form (ISO 32000-1
+/// §8.7.4.5.5): edge flag, then x, y, then colour components, each written at
+/// its declared bit width via [`BitWriter`] with coordinates/components mapped
+/// through `decode`. Each vertex's data is an integral number of bytes.
+fn pack_vertex(
+    vertex: &GouraudVertex,
+    bits_per_flag: u8,
+    bits_per_coordinate: u8,
+    bits_per_component: u8,
+    decode: &[f64],
+    color_space: &str,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write_bits(vertex.flag as u64, bits_per_flag);
+    w.write_bits(
+        encode_value(vertex.x, decode[0], decode[1], bits_per_coordinate),
+        bits_per_coordinate,
+    );
+    w.write_bits(
+        encode_value(vertex.y, decode[2], decode[3], bits_per_coordinate),
+        bits_per_coordinate,
+    );
+    for (i, comp) in color_components(&vertex.color, color_space)
+        .into_iter()
+        .enumerate()
+    {
+        let lo = decode[4 + 2 * i];
+        let hi = decode[4 + 2 * i + 1];
+        w.write_bits(
+            encode_value(comp, lo, hi, bits_per_component),
+            bits_per_component,
+        );
+    }
+    w.align_to_byte();
+    w.into_bytes()
+}
+
+/// Number of colour components for a device colour space name (used to size
+/// the `/Decode` array and validate mesh vertex colours).
+fn n_components(color_space: &str) -> usize {
+    match color_space {
+        "DeviceGray" => 1,
+        "DeviceCMYK" => 4,
+        // DeviceRGB and any unexpected name default to 3-component RGB.
+        _ => 3,
+    }
+}
+
+/// Free-form Gouraud-shaded triangle mesh (Type 4 shading, ISO 32000-1
+/// §8.7.4.5.5). Emitted as a PDF stream: the shading dictionary plus a binary
+/// body of packed vertex data. Construct with [`FreeFormGouraudShading::new`]
+/// (defaulting to 16-bit coordinates and 8-bit components/flags) and adjust the
+/// bit widths with [`with_bits`](FreeFormGouraudShading::with_bits).
+///
+/// Marked `#[non_exhaustive]`: future additive fields (e.g. an optional
+/// `/Function` over the vertices) must not break external construction, so
+/// build via `new`/`with_bits` rather than a struct literal across crates.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FreeFormGouraudShading {
+    /// Shading name for referencing.
+    pub name: String,
+    /// Device colour space name (`DeviceGray`/`DeviceRGB`/`DeviceCMYK`).
+    pub color_space: String,
+    /// Bits per coordinate (∈ {1,2,4,8,12,16,24,32}).
+    pub bits_per_coordinate: u8,
+    /// Bits per colour component (∈ {1,2,4,8,12,16}).
+    pub bits_per_component: u8,
+    /// Bits per edge flag (∈ {2,4,8}).
+    pub bits_per_flag: u8,
+    /// Decode array `[xmin xmax ymin ymax c1min c1max …]` (§8.7.4.5.5).
+    pub decode: Vec<f64>,
+    /// Mesh vertices in emission order.
+    pub vertices: Vec<GouraudVertex>,
+}
+
+impl FreeFormGouraudShading {
+    /// Create a mesh shading with default bit widths (16-bit coordinates,
+    /// 8-bit components, 8-bit flags). `decode` must have
+    /// `4 + 2 * n_components(color_space)` entries.
+    pub fn new(
+        name: impl Into<String>,
+        color_space: impl Into<String>,
+        decode: Vec<f64>,
+        vertices: Vec<GouraudVertex>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            color_space: color_space.into(),
+            bits_per_coordinate: 16,
+            bits_per_component: 8,
+            bits_per_flag: 8,
+            decode,
+            vertices,
+        }
+    }
+
+    /// Override the packed bit widths.
+    pub fn with_bits(
+        mut self,
+        bits_per_coordinate: u8,
+        bits_per_component: u8,
+        bits_per_flag: u8,
+    ) -> Self {
+        self.bits_per_coordinate = bits_per_coordinate;
+        self.bits_per_component = bits_per_component;
+        self.bits_per_flag = bits_per_flag;
+        self
+    }
+
+    /// Validate the mesh against the Type 4 constraints (ISO 32000-1
+    /// §8.7.4.5.5): permitted bit widths, `/Decode` length matching the colour
+    /// space, at least one vertex, and a leading edge flag of 0.
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.bits_per_coordinate, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+            return Err(PdfError::InvalidStructure(format!(
+                "BitsPerCoordinate must be 1,2,4,8,12,16,24 or 32, got {}",
+                self.bits_per_coordinate
+            )));
+        }
+        if !matches!(self.bits_per_component, 1 | 2 | 4 | 8 | 12 | 16) {
+            return Err(PdfError::InvalidStructure(format!(
+                "BitsPerComponent must be 1,2,4,8,12 or 16, got {}",
+                self.bits_per_component
+            )));
+        }
+        if !matches!(self.bits_per_flag, 2 | 4 | 8) {
+            return Err(PdfError::InvalidStructure(format!(
+                "BitsPerFlag must be 2, 4 or 8, got {}",
+                self.bits_per_flag
+            )));
+        }
+        let expected = 4 + 2 * n_components(&self.color_space);
+        if self.decode.len() != expected {
+            return Err(PdfError::InvalidStructure(format!(
+                "Decode must have {} entries for {}, got {}",
+                expected,
+                self.color_space,
+                self.decode.len()
+            )));
+        }
+        // Each Decode pair must be non-decreasing: `encode_value` maps within
+        // `[lo, hi]` (a reversed range would panic `f64::clamp`) and this
+        // encoder does not express an inverted decode.
+        for pair in self.decode.chunks_exact(2) {
+            if pair[0] > pair[1] {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Decode ranges must be non-decreasing, got [{}, {}]",
+                    pair[0], pair[1]
+                )));
+            }
+        }
+        if self.vertices.is_empty() {
+            return Err(PdfError::InvalidStructure(
+                "Mesh shading must have at least one vertex".to_string(),
+            ));
+        }
+        if self.vertices[0].flag != 0 {
+            return Err(PdfError::InvalidStructure(
+                "First mesh vertex must have edge flag 0".to_string(),
+            ));
+        }
+        // Per-vertex checks: edge flags are 0/1/2 (bit packer would silently
+        // truncate anything larger), and a `DeviceGray` mesh requires
+        // `Color::Gray` vertices (other variants would hit the unreachable! in
+        // `color_components`). RGB/CMYK spaces convert any `Color` losslessly.
+        let gray_space = self.color_space == "DeviceGray";
+        for (i, v) in self.vertices.iter().enumerate() {
+            if v.flag > 2 {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Vertex {i} edge flag must be 0, 1 or 2, got {}",
+                    v.flag
+                )));
+            }
+            if gray_space && !matches!(v.color, Color::Gray(_)) {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Vertex {i} color must be Color::Gray to match DeviceGray, got {:?}",
+                    v.color
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the Type 4 shading as a PDF stream object: the shading dictionary
+    /// plus the byte-aligned packed vertex data. A mesh cannot be inlined as a
+    /// plain dictionary, so this is the emission entry point (the writer hoists
+    /// it to an indirect object).
+    pub fn to_pdf_object(&self) -> Result<Object> {
+        self.validate()?;
+
+        let mut dict = Dictionary::new();
+        dict.set(
+            "ShadingType",
+            Object::Integer(ShadingType::FreeFormGouraud as i64),
+        );
+        dict.set("ColorSpace", Object::Name(self.color_space.clone()));
+        dict.set(
+            "BitsPerCoordinate",
+            Object::Integer(self.bits_per_coordinate as i64),
+        );
+        dict.set(
+            "BitsPerComponent",
+            Object::Integer(self.bits_per_component as i64),
+        );
+        dict.set("BitsPerFlag", Object::Integer(self.bits_per_flag as i64));
+        dict.set(
+            "Decode",
+            Object::Array(self.decode.iter().map(|&d| Object::Real(d)).collect()),
+        );
+
+        let mut data = Vec::new();
+        for v in &self.vertices {
+            data.extend(pack_vertex(
+                v,
+                self.bits_per_flag,
+                self.bits_per_coordinate,
+                self.bits_per_component,
+                &self.decode,
+                &self.color_space,
+            ));
+        }
+
+        Ok(Object::Stream(dict, data))
+    }
+}
+
+/// Assemble a Type 4 (PostScript calculator) function object (ISO 32000-1
+/// §7.10.5): a stream whose body is the calculator program `code` verbatim,
+/// with the given `/Domain` and `/Range`. Mirrors the shape used elsewhere in
+/// the crate (`devicen_color`), returned as `(dict, bytes)` for the writer to
+/// hoist to an indirect object.
+fn postscript_type4_function(code: &str, domain: &[f64], range: &[f64]) -> (Dictionary, Vec<u8>) {
+    let mut dict = Dictionary::new();
+    dict.set("FunctionType", Object::Integer(4));
+    dict.set(
+        "Domain",
+        Object::Array(domain.iter().map(|&d| Object::Real(d)).collect()),
+    );
+    dict.set(
+        "Range",
+        Object::Array(range.iter().map(|&r| Object::Real(r)).collect()),
+    );
+    (dict, code.as_bytes().to_vec())
+}
+
+/// PostScript that maps a local parameter `t ∈ [0,1]` on the stack to the `n`
+/// colour components of a two-stop linear interpolation `start → end`. Ends
+/// with the components in order (component 0 deepest).
+fn ramp2_ps(start: &Color, end: &Color, space: &str) -> String {
+    let s = color_components(start, space);
+    let e = color_components(end, space);
+    let n = s.len();
+    let mut parts = Vec::with_capacity(n);
+    for j in 0..n {
+        let block = format!("{} mul {} add", e[j] - s[j], s[j]);
+        if j + 1 < n {
+            // Keep a fresh copy of t for the next component and tuck the result
+            // beneath it, preserving output order.
+            parts.push(format!("dup {block} exch"));
+        } else {
+            parts.push(block);
+        }
+    }
+    parts.join(" ")
+}
+
+/// PostScript that remaps a global `t` on the stack to a segment-local
+/// parameter `(t - lo) / (hi - lo)`.
+fn remap_local_ps(lo: f64, hi: f64) -> String {
+    format!("{} sub {} div", lo, hi - lo)
+}
+
+/// PostScript mapping a global `t ∈ [0,1]` on the stack to colour components
+/// across `stops` (≥ 1). One stop → constant colour (discards `t`); two →
+/// [`ramp2_ps`]; more → nested `ifelse` split at the interior stop positions,
+/// each segment remapped to `[0,1]` then interpolated.
+fn build_color_ramp_ps(stops: &[ColorStop], space: &str) -> String {
+    match stops {
+        [] => String::new(),
+        [only] => {
+            let mut s = String::from("pop");
+            for c in color_components(&only.color, space) {
+                s.push_str(&format!(" {c}"));
+            }
+            s
+        }
+        [a, b] => ramp2_ps(&a.color, &b.color, space),
+        _ => build_ramp_nested_ps(stops, space),
+    }
+}
+
+/// Recursive nested-`ifelse` ramp for 3+ stops. Each level splits at the next
+/// interior stop position; the deepest level (two stops) is a remapped
+/// [`ramp2_ps`].
+fn build_ramp_nested_ps(stops: &[ColorStop], space: &str) -> String {
+    debug_assert!(stops.len() >= 2);
+    let lo = stops[0].position;
+    let hi = stops[1].position;
+    let seg0 = format!(
+        "{} {}",
+        remap_local_ps(lo, hi),
+        ramp2_ps(&stops[0].color, &stops[1].color, space)
+    );
+    if stops.len() == 2 {
+        return seg0;
+    }
+    let split = stops[1].position;
+    let rest = build_ramp_nested_ps(&stops[1..], space);
+    format!("dup {split} lt {{ {seg0} }} {{ {rest} }} ifelse")
+}
+
+/// PostScript prologue for a conic (angular) gradient: given `x y` on the
+/// stack, computes the angle of the vector from `center` and normalises it to
+/// `t = angle / 360 ∈ [0,1)`. `atan` (ISO 32000-1 Table 42) takes `num den`
+/// and returns `atan2(num, den)` in degrees `[0,360)`; with `dy dx` on the
+/// stack it yields the angle of `(dx, dy)`.
+fn build_conic_angle_prologue(center: Point) -> String {
+    // stack: x y → (y - cy)=dy, exch, (x - cx)=dx → dy dx → atan → /360.
+    format!("{} sub exch {} sub atan 360 div", center.y, center.x)
+}
+
+/// Conic (angular / "sweep") gradient, emitted as an exact Type 1
+/// function-based shading (ISO 32000-1 §8.7.4.5.2) whose `/Function` is a real
+/// Type 4 PostScript calculator: the colour is a resolution-independent
+/// function of the angle around `center`, not a piecewise mesh approximation.
+///
+/// Marked `#[non_exhaustive]`: build via [`ConicShading::new`] /
+/// [`with_matrix`](ConicShading::with_matrix) so future additive fields stay
+/// non-breaking.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConicShading {
+    /// Shading name for referencing.
+    pub name: String,
+    /// Centre of the angular sweep, in the shading's domain coordinates.
+    pub center: Point,
+    /// Domain `[xmin xmax ymin ymax]` the function is evaluated over.
+    pub domain: [f64; 4],
+    /// Optional matrix mapping domain space to the shading target space.
+    pub matrix: Option<[f64; 6]>,
+    /// Colour stops swept from angle 0 (t=0) to a full turn (t=1).
+    pub color_stops: Vec<ColorStop>,
+}
+
+impl ConicShading {
+    /// Create a conic gradient centred at `center` over `domain`.
+    pub fn new(
+        name: impl Into<String>,
+        center: Point,
+        domain: [f64; 4],
+        color_stops: Vec<ColorStop>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            center,
+            domain,
+            matrix: None,
+            color_stops,
+        }
+    }
+
+    /// Set the shading-to-target transformation matrix.
+    pub fn with_matrix(mut self, matrix: [f64; 6]) -> Self {
+        self.matrix = Some(matrix);
+        self
+    }
+
+    /// Validate stops (non-empty, ascending) and domain (min < max).
+    pub fn validate(&self) -> Result<()> {
+        if self.color_stops.is_empty() {
+            return Err(PdfError::InvalidStructure(
+                "Conic shading must have at least one color stop".to_string(),
+            ));
+        }
+        if self.domain[0] >= self.domain[1] || self.domain[2] >= self.domain[3] {
+            return Err(PdfError::InvalidStructure(
+                "Invalid domain: min values must be less than max values".to_string(),
+            ));
+        }
+        // Strictly ascending: equal adjacent positions would emit a `0 div`
+        // (division by a zero-width segment) into the PostScript ramp.
+        for window in self.color_stops.windows(2) {
+            if window[0].position >= window[1].position {
+                return Err(PdfError::InvalidStructure(
+                    "Color stops must be in strictly ascending order".to_string(),
+                ));
+            }
+        }
+        // The conic sweeps the full turn: with 2+ stops the ramp maps the
+        // normalised angle t∈[0,1) across the stops, so the first must sit at
+        // 0.0 and the last at 1.0 (interior positions are honoured). Otherwise
+        // a 2-stop ramp would silently ignore its positions and a general ramp
+        // would extrapolate past the ends.
+        if self.color_stops.len() >= 2 {
+            let first = self.color_stops[0].position;
+            let last = self.color_stops[self.color_stops.len() - 1].position;
+            if first != 0.0 || last != 1.0 {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Conic color stops must span [0.0, 1.0]; first={first}, last={last}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the Type 1 function-based shading dictionary with a real Type 4
+    /// PostScript `/Function` (angle prologue + colour ramp) and the required
+    /// `/ColorSpace`. The `/Function` is inlined as a stream; the writer hoists
+    /// it to an indirect object (a stream cannot be a dictionary value).
+    pub fn to_pdf_dictionary(&self) -> Result<Dictionary> {
+        self.validate()?;
+        let space = resolve_color_space(&self.color_stops);
+        let code = format!(
+            "{{ {} {} }}",
+            build_conic_angle_prologue(self.center),
+            build_color_ramp_ps(&self.color_stops, space)
+        );
+        let range: Vec<f64> = (0..n_components(space)).flat_map(|_| [0.0, 1.0]).collect();
+        let (fdict, fbytes) = postscript_type4_function(&code, &self.domain, &range);
+
+        let mut dict = Dictionary::new();
+        dict.set(
+            "ShadingType",
+            Object::Integer(ShadingType::FunctionBased as i64),
+        );
+        dict.set("ColorSpace", Object::Name(space.to_string()));
+        dict.set(
+            "Domain",
+            Object::Array(self.domain.iter().map(|&d| Object::Real(d)).collect()),
+        );
+        dict.set("Function", Object::Stream(fdict, fbytes));
+        if let Some(matrix) = self.matrix {
+            dict.set(
+                "Matrix",
+                Object::Array(matrix.iter().map(|&v| Object::Real(v)).collect()),
+            );
+        }
+        Ok(dict)
+    }
+}
+
+/// Internal wrapper for the additive shading types (Type 4 mesh, Type 1 conic)
+/// registered via [`Page::add_mesh_shading`](crate::Page::add_mesh_shading) and
+/// [`Page::add_conic_shading`](crate::Page::add_conic_shading). Kept in a
+/// separate page collection from [`ShadingDefinition`] so the public gradient
+/// enum stays unchanged (folding these in is a 5.0.0 breaking-bundle item).
+#[derive(Debug, Clone)]
+pub(crate) enum AdvancedShading {
+    /// Type 4 free-form Gouraud mesh (emitted as a stream).
+    Mesh(FreeFormGouraudShading),
+    /// Type 1 conic gradient (emitted as a dictionary with a `/Function`
+    /// stream the writer hoists).
+    Conic(ConicShading),
+}
+
+impl AdvancedShading {
+    /// Emit the shading as a PDF object: a stream for the mesh, a dictionary
+    /// for the conic.
+    pub(crate) fn to_pdf_object(&self) -> Result<Object> {
+        match self {
+            AdvancedShading::Mesh(m) => m.to_pdf_object(),
+            AdvancedShading::Conic(c) => Ok(Object::Dictionary(c.to_pdf_dictionary()?)),
+        }
+    }
 }
 
 /// Coordinate point for shading definitions
@@ -819,6 +1366,479 @@ impl ShadingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Issue #407 Track A: BitWriter (MSB-first packing for mesh vertex data) ──
+
+    #[test]
+    fn test_bitwriter_single_value_byte_aligned() {
+        // 4 bits 0b1011 then pad to a byte → 0b1011_0000.
+        let mut w = BitWriter::new();
+        w.write_bits(0b1011, 4);
+        w.align_to_byte();
+        assert_eq!(w.into_bytes(), vec![0xB0]);
+    }
+
+    #[test]
+    fn test_bitwriter_value_spans_two_bytes() {
+        // 9-bit value 0x1FF crosses the byte boundary: 1111_1111 | 1___ then pad.
+        let mut w = BitWriter::new();
+        w.write_bits(0b1_1111_1111, 9);
+        w.align_to_byte();
+        assert_eq!(w.into_bytes(), vec![0xFF, 0x80]);
+    }
+
+    #[test]
+    fn test_bitwriter_accumulates_across_writes() {
+        // 0b10 then 0b110 → 0b10110, padded to 0b1011_0000.
+        let mut w = BitWriter::new();
+        w.write_bits(0b10, 2);
+        w.write_bits(0b110, 3);
+        w.align_to_byte();
+        assert_eq!(w.into_bytes(), vec![0xB0]);
+    }
+
+    #[test]
+    fn test_encode_value_maps_real_to_packed_integer() {
+        // 50 in [0,100] over 8 bits → 0.5 * 255 = 127.5 → round half away → 128.
+        assert_eq!(encode_value(50.0, 0.0, 100.0, 8), 128);
+    }
+
+    #[test]
+    fn test_encode_value_clamps_out_of_range() {
+        assert_eq!(encode_value(150.0, 0.0, 100.0, 8), 255);
+        assert_eq!(encode_value(-10.0, 0.0, 100.0, 8), 0);
+        assert_eq!(encode_value(100.0, 0.0, 100.0, 8), 255);
+    }
+
+    #[test]
+    fn test_encode_value_16_bit_precision() {
+        // 0.5 in [0,1] over 16 bits → 0.5 * 65535 = 32767.5 → round half away → 32768.
+        assert_eq!(encode_value(0.5, 0.0, 1.0, 16), 32768);
+    }
+
+    #[test]
+    fn test_gouraud_vertex_pack_byte_aligned() {
+        // flag(8) + x,y(16 each) + 3 rgb components(8 each) = 64 bits = 8 bytes.
+        let v = GouraudVertex {
+            flag: 0,
+            x: 10.0,
+            y: 20.0,
+            color: Color::Rgb(1.0, 0.0, 0.0),
+        };
+        let decode = [0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let bytes = pack_vertex(&v, 8, 16, 8, &decode, "DeviceRGB");
+        // x=10→0.1*65535=6554=0x199A, y=20→0x3333, r=255,g=0,b=0.
+        assert_eq!(bytes, vec![0x00, 0x19, 0x9A, 0x33, 0x33, 0xFF, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_gouraud_vertex_pack_with_padding() {
+        // flag(2) + x,y(8 each) + 1 gray component(8) = 26 bits → 4 bytes (6 pad).
+        let v = GouraudVertex {
+            flag: 1,
+            x: 50.0,
+            y: 25.0,
+            color: Color::Gray(0.5),
+        };
+        let decode = [0.0, 100.0, 0.0, 100.0, 0.0, 1.0];
+        let bytes = pack_vertex(&v, 2, 8, 8, &decode, "DeviceGray");
+        // flag=01, x=128=0x80, y=64=0x40, gray=128=0x80 → 01 10000000 01000000 10000000.
+        assert_eq!(bytes, vec![0x60, 0x10, 0x20, 0x00]);
+    }
+
+    /// Three valid RGB vertices for the mesh-level tests (flags 0,1,1).
+    fn sample_rgb_mesh() -> FreeFormGouraudShading {
+        FreeFormGouraudShading::new(
+            "M".to_string(),
+            "DeviceRGB".to_string(),
+            vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            vec![
+                GouraudVertex {
+                    flag: 0,
+                    x: 10.0,
+                    y: 20.0,
+                    color: Color::Rgb(1.0, 0.0, 0.0),
+                },
+                GouraudVertex {
+                    flag: 1,
+                    x: 50.0,
+                    y: 50.0,
+                    color: Color::Rgb(0.0, 1.0, 0.0),
+                },
+                GouraudVertex {
+                    flag: 1,
+                    x: 90.0,
+                    y: 10.0,
+                    color: Color::Rgb(0.0, 0.0, 1.0),
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn test_freeform_gouraud_creation_defaults() {
+        let mesh = sample_rgb_mesh();
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.name, "M");
+        assert_eq!(mesh.color_space, "DeviceRGB");
+        // new() defaults: 16-bit coords, 8-bit components, 8-bit flags.
+        assert_eq!(mesh.bits_per_coordinate, 16);
+        assert_eq!(mesh.bits_per_component, 8);
+        assert_eq!(mesh.bits_per_flag, 8);
+        assert_eq!(mesh.vertices.len(), 3);
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_invalid_bits() {
+        let mut m = sample_rgb_mesh();
+        m.bits_per_coordinate = 5; // not in {1,2,4,8,12,16,24,32}
+        assert!(m.validate().is_err());
+
+        let mut m = sample_rgb_mesh();
+        m.bits_per_component = 3; // not in {1,2,4,8,12,16}
+        assert!(m.validate().is_err());
+
+        let mut m = sample_rgb_mesh();
+        m.bits_per_flag = 3; // not in {2,4,8}
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_decode_length_mismatch() {
+        let mut m = sample_rgb_mesh();
+        // DeviceRGB needs 4 + 2*3 = 10 entries; give 8.
+        m.decode = vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_empty_vertices() {
+        let mut m = sample_rgb_mesh();
+        m.vertices.clear();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_nonzero_first_flag() {
+        let mut m = sample_rgb_mesh();
+        m.vertices[0].flag = 1;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_to_pdf_object_dict_keys() {
+        let obj = sample_rgb_mesh().to_pdf_object().unwrap();
+        let dict = match &obj {
+            Object::Stream(d, _) => d,
+            other => panic!("mesh must emit a Stream, got {other:?}"),
+        };
+        assert_eq!(dict.get("ShadingType"), Some(&Object::Integer(4)));
+        assert_eq!(
+            dict.get("ColorSpace"),
+            Some(&Object::Name("DeviceRGB".to_string()))
+        );
+        assert_eq!(dict.get("BitsPerCoordinate"), Some(&Object::Integer(16)));
+        assert_eq!(dict.get("BitsPerComponent"), Some(&Object::Integer(8)));
+        assert_eq!(dict.get("BitsPerFlag"), Some(&Object::Integer(8)));
+        assert_eq!(
+            dict.get("Decode"),
+            Some(&Object::Array(
+                vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_freeform_gouraud_stream_body_exact_bytes() {
+        let obj = sample_rgb_mesh().to_pdf_object().unwrap();
+        let data = match &obj {
+            Object::Stream(_, d) => d,
+            other => panic!("mesh must emit a Stream, got {other:?}"),
+        };
+        assert_eq!(
+            *data,
+            vec![
+                // v0: flag0, x10, y20, red
+                0x00, 0x19, 0x9A, 0x33, 0x33, 0xFF, 0x00, 0x00, //
+                // v1: flag1, x50, y50, green
+                0x01, 0x80, 0x00, 0x80, 0x00, 0x00, 0xFF, 0x00, //
+                // v2: flag1, x90, y10, blue
+                0x01, 0xE6, 0x66, 0x19, 0x9A, 0x00, 0x00, 0xFF,
+            ]
+        );
+    }
+
+    // ── Issue #407 Track B: Type 1 conic (PostScript Type 4 function) ──
+
+    #[test]
+    fn test_postscript_type4_function_shape() {
+        // Wraps arbitrary calculator code with FunctionType 4 + Domain/Range;
+        // the code bytes are stored verbatim (no transformation).
+        let (dict, code) = postscript_type4_function(
+            "{ 1 }",
+            &[0.0, 1.0, 0.0, 1.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        );
+        assert_eq!(dict.get("FunctionType"), Some(&Object::Integer(4)));
+        assert_eq!(
+            dict.get("Domain"),
+            Some(&Object::Array(
+                vec![0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        assert_eq!(
+            dict.get("Range"),
+            Some(&Object::Array(
+                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        assert_eq!(code, b"{ 1 }");
+    }
+
+    #[test]
+    fn test_color_ramp_ps_two_stops_no_branching() {
+        // 2 stops → straight per-component linear interpolation of a local t on
+        // the stack, no ifelse. red→blue over DeviceRGB: deltas (-1, 0, 1).
+        let stops = vec![
+            ColorStop::new(0.0, Color::Rgb(1.0, 0.0, 0.0)),
+            ColorStop::new(1.0, Color::Rgb(0.0, 0.0, 1.0)),
+        ];
+        let ps = build_color_ramp_ps(&stops, "DeviceRGB");
+        assert_eq!(ps, "dup -1 mul 1 add exch dup 0 mul 0 add exch 1 mul 0 add");
+        assert!(!ps.contains("ifelse"));
+    }
+
+    #[test]
+    fn test_color_ramp_ps_three_stops_has_bound_check() {
+        // 3 stops → one ifelse splitting at the interior stop (0.5), two
+        // interpolation segments (3 muls each over DeviceRGB → 6 total).
+        let stops = vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(0.5, Color::green()),
+            ColorStop::new(1.0, Color::blue()),
+        ];
+        let ps = build_color_ramp_ps(&stops, "DeviceRGB");
+        assert_eq!(ps.matches("ifelse").count(), 1, "one split for three stops");
+        assert!(ps.contains("0.5"), "interior bound present");
+        assert_eq!(ps.matches("mul").count(), 6, "two RGB segments");
+    }
+
+    #[test]
+    fn test_conic_angle_prologue_exact_ps() {
+        // stack in: x y. dy=y-cy, dx=x-cx, angle=atan2(dy,dx), t=angle/360.
+        let ps = build_conic_angle_prologue(Point::new(50.0, 50.0));
+        assert_eq!(ps, "50 sub exch 50 sub atan 360 div");
+    }
+
+    #[test]
+    fn test_conic_shading_emits_type1_with_ps_function_and_colorspace() {
+        let stops = vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(1.0, Color::blue()),
+        ];
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(50.0, 50.0),
+            [0.0, 100.0, 0.0, 100.0],
+            stops.clone(),
+        );
+        let dict = conic.to_pdf_dictionary().unwrap();
+
+        // Function-based (Type 1) shading with the required ColorSpace + Domain.
+        assert_eq!(dict.get("ShadingType"), Some(&Object::Integer(1)));
+        assert_eq!(
+            dict.get("ColorSpace"),
+            Some(&Object::Name("DeviceRGB".to_string()))
+        );
+        assert_eq!(
+            dict.get("Domain"),
+            Some(&Object::Array(
+                vec![0.0, 100.0, 0.0, 100.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+
+        // /Function is a real Type 4 PostScript stream, not a placeholder.
+        let (fdict, fcode) = match dict.get("Function") {
+            Some(Object::Stream(d, c)) => (d, c),
+            other => panic!("Function must be a Type 4 stream, got {other:?}"),
+        };
+        assert_eq!(fdict.get("FunctionType"), Some(&Object::Integer(4)));
+        // Function domain == shading domain (2 inputs x, y).
+        assert_eq!(
+            fdict.get("Domain"),
+            Some(&Object::Array(
+                vec![0.0, 100.0, 0.0, 100.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        // Range == n_components pairs of [0, 1] (3 for RGB).
+        assert_eq!(
+            fdict.get("Range"),
+            Some(&Object::Array(
+                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect()
+            ))
+        );
+        // Program == "{ <angle prologue> <colour ramp> }".
+        let expected = format!(
+            "{{ {} {} }}",
+            build_conic_angle_prologue(Point::new(50.0, 50.0)),
+            build_color_ramp_ps(&stops, "DeviceRGB")
+        );
+        assert_eq!(fcode, &expected.into_bytes());
+    }
+
+    #[test]
+    fn test_conic_shading_validate_rejects_bad_domain_and_empty_stops() {
+        let stops = vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(1.0, Color::blue()),
+        ];
+        let bad_domain = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [1.0, 0.0, 0.0, 1.0], // xmin > xmax
+            stops,
+        );
+        assert!(bad_domain.validate().is_err());
+
+        let empty = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [0.0, 1.0, 0.0, 1.0],
+            vec![],
+        );
+        assert!(empty.validate().is_err());
+    }
+
+    // ── #407 QR hardening: validate() must reject inputs that would otherwise
+    //    panic (clamp/unreachable) or emit malformed output ──
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_color_space_mismatch() {
+        // DeviceGray declared but vertices carry RGB colours → would hit the
+        // unreachable! in color_components; validate must reject first.
+        let mut m = sample_rgb_mesh();
+        m.color_space = "DeviceGray".to_string();
+        m.decode = vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0]; // valid DeviceGray length
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_inverted_decode() {
+        // Inverted x range [100,0] would panic f64::clamp in encode_value.
+        let mut m = sample_rgb_mesh();
+        m.decode[0] = 100.0;
+        m.decode[1] = 0.0;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_out_of_range_flag() {
+        // Edge flags are 0/1/2 (ISO 32000-1 §8.7.4.5.5); 3 would be silently
+        // truncated by the bit packer.
+        let mut m = sample_rgb_mesh();
+        m.vertices[1].flag = 3;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_cmyk_mesh_validates_and_packs() {
+        // Coverage: a CMYK mesh (4 components → 12 decode entries) round-trips
+        // through validate + pack.
+        let mesh = FreeFormGouraudShading::new(
+            "Cmyk".to_string(),
+            "DeviceCMYK".to_string(),
+            vec![
+                0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+            ],
+            vec![GouraudVertex {
+                flag: 0,
+                x: 0.0,
+                y: 0.0,
+                color: Color::Cmyk(1.0, 0.0, 0.0, 0.0),
+            }],
+        )
+        .with_bits(8, 8, 8);
+        assert!(mesh.validate().is_ok());
+        let bytes = pack_vertex(&mesh.vertices[0], 8, 8, 8, &mesh.decode, "DeviceCMYK");
+        // flag0, x0, y0, then cyan=255, m=0, y=0, k=0.
+        assert_eq!(bytes, vec![0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_conic_shading_validate_requires_full_range_endpoints() {
+        // Stops at 0.25/0.75 (not 0/1) would silently produce the same program
+        // as 0/1 — reject so the caller isn't misled.
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [0.0, 1.0, 0.0, 1.0],
+            vec![
+                ColorStop::new(0.25, Color::red()),
+                ColorStop::new(0.75, Color::blue()),
+            ],
+        );
+        assert!(conic.validate().is_err());
+    }
+
+    #[test]
+    fn test_conic_shading_validate_rejects_equal_positions() {
+        // Equal adjacent positions would emit `0 div` into the PostScript ramp.
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [0.0, 1.0, 0.0, 1.0],
+            vec![
+                ColorStop::new(0.0, Color::red()),
+                ColorStop::new(0.5, Color::green()),
+                ColorStop::new(0.5, Color::blue()),
+                ColorStop::new(1.0, Color::red()),
+            ],
+        );
+        assert!(conic.validate().is_err());
+    }
+
+    #[test]
+    fn test_conic_shading_three_stops_no_zero_div_and_one_ifelse() {
+        // A valid 3-stop conic (endpoints 0/1, strictly ascending) produces a
+        // well-formed nested ramp: no `0 div`, exactly one ifelse.
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(50.0, 50.0),
+            [0.0, 100.0, 0.0, 100.0],
+            vec![
+                ColorStop::new(0.0, Color::red()),
+                ColorStop::new(0.5, Color::green()),
+                ColorStop::new(1.0, Color::blue()),
+            ],
+        );
+        let dict = conic.to_pdf_dictionary().unwrap();
+        let code = match dict.get("Function") {
+            Some(Object::Stream(_, c)) => String::from_utf8(c.clone()).unwrap(),
+            other => panic!("Function must be a stream, got {other:?}"),
+        };
+        // A zero-width segment would emit the token ` 0 div`; the angle
+        // prologue's `360 div` must not be mistaken for it.
+        assert!(!code.contains(" 0 div"), "no zero-width segment:\n{code}");
+        assert_eq!(code.matches("ifelse").count(), 1);
+    }
 
     #[test]
     fn test_color_stop_creation() {

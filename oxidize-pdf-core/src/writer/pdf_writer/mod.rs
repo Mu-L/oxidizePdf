@@ -2937,28 +2937,30 @@ impl<W: Write> PdfWriter<W> {
             resources.set("Pattern", Object::Dictionary(pat_dict));
         }
 
-        if !page.shadings().is_empty() {
+        if !page.shadings().is_empty() || !page.advanced_shadings().is_empty() {
             let mut sh_dict = Dictionary::new();
+
+            // Gradient shadings (Axial/Radial/FunctionBased) → dictionaries.
             let mut entries: Vec<(&String, &crate::graphics::ShadingDefinition)> =
                 page.shadings().iter().collect();
             entries.sort_by_key(|(name, _)| name.as_str());
             for (name, shading) in entries {
-                let mut shading_dict = shading.to_pdf_dictionary()?;
-                // Hoist the inline /Function to an indirect object (issue #297 B).
-                // ISO 32000-1 §8.7.4.5.2: functions are normally indirect. Only
-                // a dictionary value is hoisted; FunctionBased shadings carry an
-                // external function id (an Integer) which is left untouched.
-                if let Some(Object::Dictionary(_)) = shading_dict.get("Function") {
-                    if let Some(func_obj) = shading_dict.remove("Function") {
-                        let func_id = self.allocate_object_id();
-                        self.write_object(func_id, func_obj)?;
-                        shading_dict.set("Function", Object::Reference(func_id));
-                    }
-                }
-                let shading_id = self.allocate_object_id();
-                self.write_object(shading_id, Object::Dictionary(shading_dict))?;
+                let obj = Object::Dictionary(shading.to_pdf_dictionary()?);
+                let shading_id = self.write_shading_object(obj)?;
                 sh_dict.set(name, Object::Reference(shading_id));
             }
+
+            // Additive mesh (Type 4, stream) / conic (Type 1, dict) shadings
+            // (#407), emitted into the same /Shading resource.
+            let mut adv: Vec<(&String, &crate::graphics::AdvancedShading)> =
+                page.advanced_shadings().iter().collect();
+            adv.sort_by_key(|(name, _)| name.as_str());
+            for (name, shading) in adv {
+                let obj = shading.to_pdf_object()?;
+                let shading_id = self.write_shading_object(obj)?;
+                sh_dict.set(name, Object::Reference(shading_id));
+            }
+
             resources.set("Shading", Object::Dictionary(sh_dict));
         }
 
@@ -3471,6 +3473,44 @@ impl<W: Write> PdfWriter<W> {
         let id = ObjectId::new(self.next_object_id, 0);
         self.next_object_id += 1;
         id
+    }
+
+    /// Write a shading as an indirect object and return its id. For a
+    /// dictionary shading, an inline `/Function` (dictionary OR stream) is
+    /// first hoisted to its own indirect object: ISO 32000-1 §8.7.4.5.2 makes
+    /// functions normally indirect, and a stream in particular CANNOT be an
+    /// inline dictionary value (the conic Type 4 PostScript function would
+    /// otherwise be invalid PDF). A `FunctionBased` shading whose `/Function`
+    /// is an `Integer` placeholder is left untouched. Stream shadings (the
+    /// Type 4 mesh) are written directly.
+    fn write_shading_object(&mut self, obj: Object) -> Result<ObjectId> {
+        match obj {
+            Object::Dictionary(mut dict) => {
+                if matches!(
+                    dict.get("Function"),
+                    Some(Object::Dictionary(_)) | Some(Object::Stream(_, _))
+                ) {
+                    if let Some(func_obj) = dict.remove("Function") {
+                        let func_id = self.allocate_object_id();
+                        self.write_object(func_id, func_obj)?;
+                        dict.set("Function", Object::Reference(func_id));
+                    }
+                }
+                let shading_id = self.allocate_object_id();
+                self.write_object(shading_id, Object::Dictionary(dict))?;
+                Ok(shading_id)
+            }
+            stream @ Object::Stream(_, _) => {
+                let shading_id = self.allocate_object_id();
+                self.write_object(shading_id, stream)?;
+                Ok(shading_id)
+            }
+            other => {
+                let shading_id = self.allocate_object_id();
+                self.write_object(shading_id, other)?;
+                Ok(shading_id)
+            }
+        }
     }
 
     /// Get catalog_id, returning error if not initialized
