@@ -87,6 +87,9 @@ fn color_components(color: &Color, space: &str) -> Vec<f64> {
             vec![c, m, y, k]
         }
         // DeviceRGB (and any unexpected name) → exact RGB conversion.
+        // Invariant: `Color::to_rgb` (color.rs) always returns `Color::Rgb`. If
+        // a future `Color` variant changes that, update this arm — the compiler
+        // will not flag it here.
         _ => match color.to_rgb() {
             Color::Rgb(r, g, b) => vec![r, g, b],
             _ => unreachable!("to_rgb always yields Color::Rgb"),
@@ -424,6 +427,17 @@ impl FreeFormGouraudShading {
                 self.decode.len()
             )));
         }
+        // Each Decode pair must be non-decreasing: `encode_value` maps within
+        // `[lo, hi]` (a reversed range would panic `f64::clamp`) and this
+        // encoder does not express an inverted decode.
+        for pair in self.decode.chunks_exact(2) {
+            if pair[0] > pair[1] {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Decode ranges must be non-decreasing, got [{}, {}]",
+                    pair[0], pair[1]
+                )));
+            }
+        }
         if self.vertices.is_empty() {
             return Err(PdfError::InvalidStructure(
                 "Mesh shading must have at least one vertex".to_string(),
@@ -433,6 +447,25 @@ impl FreeFormGouraudShading {
             return Err(PdfError::InvalidStructure(
                 "First mesh vertex must have edge flag 0".to_string(),
             ));
+        }
+        // Per-vertex checks: edge flags are 0/1/2 (bit packer would silently
+        // truncate anything larger), and a `DeviceGray` mesh requires
+        // `Color::Gray` vertices (other variants would hit the unreachable! in
+        // `color_components`). RGB/CMYK spaces convert any `Color` losslessly.
+        let gray_space = self.color_space == "DeviceGray";
+        for (i, v) in self.vertices.iter().enumerate() {
+            if v.flag > 2 {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Vertex {i} edge flag must be 0, 1 or 2, got {}",
+                    v.flag
+                )));
+            }
+            if gray_space && !matches!(v.color, Color::Gray(_)) {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Vertex {i} color must be Color::Gray to match DeviceGray, got {:?}",
+                    v.color
+                )));
+            }
         }
         Ok(())
     }
@@ -633,11 +666,27 @@ impl ConicShading {
                 "Invalid domain: min values must be less than max values".to_string(),
             ));
         }
+        // Strictly ascending: equal adjacent positions would emit a `0 div`
+        // (division by a zero-width segment) into the PostScript ramp.
         for window in self.color_stops.windows(2) {
-            if window[0].position > window[1].position {
+            if window[0].position >= window[1].position {
                 return Err(PdfError::InvalidStructure(
-                    "Color stops must be in ascending order".to_string(),
+                    "Color stops must be in strictly ascending order".to_string(),
                 ));
+            }
+        }
+        // The conic sweeps the full turn: with 2+ stops the ramp maps the
+        // normalised angle t∈[0,1) across the stops, so the first must sit at
+        // 0.0 and the last at 1.0 (interior positions are honoured). Otherwise
+        // a 2-stop ramp would silently ignore its positions and a general ramp
+        // would extrapolate past the ends.
+        if self.color_stops.len() >= 2 {
+            let first = self.color_stops[0].position;
+            let last = self.color_stops[self.color_stops.len() - 1].position;
+            if first != 0.0 || last != 1.0 {
+                return Err(PdfError::InvalidStructure(format!(
+                    "Conic color stops must span [0.0, 1.0]; first={first}, last={last}"
+                )));
             }
         }
         Ok(())
@@ -1676,6 +1725,119 @@ mod tests {
             vec![],
         );
         assert!(empty.validate().is_err());
+    }
+
+    // ── #407 QR hardening: validate() must reject inputs that would otherwise
+    //    panic (clamp/unreachable) or emit malformed output ──
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_color_space_mismatch() {
+        // DeviceGray declared but vertices carry RGB colours → would hit the
+        // unreachable! in color_components; validate must reject first.
+        let mut m = sample_rgb_mesh();
+        m.color_space = "DeviceGray".to_string();
+        m.decode = vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0]; // valid DeviceGray length
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_inverted_decode() {
+        // Inverted x range [100,0] would panic f64::clamp in encode_value.
+        let mut m = sample_rgb_mesh();
+        m.decode[0] = 100.0;
+        m.decode[1] = 0.0;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_validate_rejects_out_of_range_flag() {
+        // Edge flags are 0/1/2 (ISO 32000-1 §8.7.4.5.5); 3 would be silently
+        // truncated by the bit packer.
+        let mut m = sample_rgb_mesh();
+        m.vertices[1].flag = 3;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_freeform_gouraud_cmyk_mesh_validates_and_packs() {
+        // Coverage: a CMYK mesh (4 components → 12 decode entries) round-trips
+        // through validate + pack.
+        let mesh = FreeFormGouraudShading::new(
+            "Cmyk".to_string(),
+            "DeviceCMYK".to_string(),
+            vec![
+                0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+            ],
+            vec![GouraudVertex {
+                flag: 0,
+                x: 0.0,
+                y: 0.0,
+                color: Color::Cmyk(1.0, 0.0, 0.0, 0.0),
+            }],
+        )
+        .with_bits(8, 8, 8);
+        assert!(mesh.validate().is_ok());
+        let bytes = pack_vertex(&mesh.vertices[0], 8, 8, 8, &mesh.decode, "DeviceCMYK");
+        // flag0, x0, y0, then cyan=255, m=0, y=0, k=0.
+        assert_eq!(bytes, vec![0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_conic_shading_validate_requires_full_range_endpoints() {
+        // Stops at 0.25/0.75 (not 0/1) would silently produce the same program
+        // as 0/1 — reject so the caller isn't misled.
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [0.0, 1.0, 0.0, 1.0],
+            vec![
+                ColorStop::new(0.25, Color::red()),
+                ColorStop::new(0.75, Color::blue()),
+            ],
+        );
+        assert!(conic.validate().is_err());
+    }
+
+    #[test]
+    fn test_conic_shading_validate_rejects_equal_positions() {
+        // Equal adjacent positions would emit `0 div` into the PostScript ramp.
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(0.0, 0.0),
+            [0.0, 1.0, 0.0, 1.0],
+            vec![
+                ColorStop::new(0.0, Color::red()),
+                ColorStop::new(0.5, Color::green()),
+                ColorStop::new(0.5, Color::blue()),
+                ColorStop::new(1.0, Color::red()),
+            ],
+        );
+        assert!(conic.validate().is_err());
+    }
+
+    #[test]
+    fn test_conic_shading_three_stops_no_zero_div_and_one_ifelse() {
+        // A valid 3-stop conic (endpoints 0/1, strictly ascending) produces a
+        // well-formed nested ramp: no `0 div`, exactly one ifelse.
+        let conic = ConicShading::new(
+            "C".to_string(),
+            Point::new(50.0, 50.0),
+            [0.0, 100.0, 0.0, 100.0],
+            vec![
+                ColorStop::new(0.0, Color::red()),
+                ColorStop::new(0.5, Color::green()),
+                ColorStop::new(1.0, Color::blue()),
+            ],
+        );
+        let dict = conic.to_pdf_dictionary().unwrap();
+        let code = match dict.get("Function") {
+            Some(Object::Stream(_, c)) => String::from_utf8(c.clone()).unwrap(),
+            other => panic!("Function must be a stream, got {other:?}"),
+        };
+        // A zero-width segment would emit the token ` 0 div`; the angle
+        // prologue's `360 div` must not be mistaken for it.
+        assert!(!code.contains(" 0 div"), "no zero-width segment:\n{code}");
+        assert_eq!(code.matches("ifelse").count(), 1);
     }
 
     #[test]
