@@ -81,6 +81,12 @@ pub struct ExtractionOptions {
     /// geometrically indistinguishable from tight-leading prose that merely
     /// contains a wide gap, so they are intentionally left in reading order
     /// rather than risk shredding prose (issue #417); text is never corrupted.
+    ///
+    /// Column blocks require gaps that align horizontally across rows: a set of
+    /// unrelated wide gaps at different X (e.g. a label/value form with varying
+    /// label lengths) is left in reading order, never reflowed (#422). A genuine
+    /// table whose column corridor drifts more than ~10pt between rows may also
+    /// be left un-reordered; text is never corrupted.
     pub reorder_columns: bool,
     /// Stop accumulating decoded text for a page once this many bytes have been
     /// collected, bounding the per-page peak memory of extraction. The limit is
