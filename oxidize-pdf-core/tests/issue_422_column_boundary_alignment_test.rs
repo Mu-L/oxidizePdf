@@ -216,9 +216,11 @@ fn extract_two_row(offset: f64) -> String {
 
 #[test]
 fn aligned_within_tolerance_merges_column_major() {
-    // Boundary drift ~4pt (< 10) → same corridor → merge → column-major:
-    // both left cells (Aa, Cc) before both right cells (Bb, Dd).
-    let text = extract_two_row(2.0);
+    // Boundary drift ~8pt: still inside the 10pt `COLUMN_ALIGN_TOL` → same
+    // corridor → merge → column-major (both left cells Aa, Cc before both right
+    // cells Bb, Dd). Chosen close to the tolerance edge so this also pins the
+    // constant: a regression shrinking `COLUMN_ALIGN_TOL` below ~8pt breaks it.
+    let text = extract_two_row(8.0);
     let cc = text.find("Cc").expect("Cc present");
     let bb = text.find("Bb").expect("Bb present");
     assert!(
