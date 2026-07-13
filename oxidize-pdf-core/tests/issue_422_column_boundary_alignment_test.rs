@@ -138,3 +138,106 @@ fn reorder_columns_preserves_reading_order_on_misaligned_form() {
         "unaligned form lines must keep reading order. Got: {text:?}"
     );
 }
+
+/// Real two-column layout: both cells' wide gap sits at the SAME X across rows.
+/// The alignment gate must still merge these and reflow column-major.
+fn build_aligned_table_pdf(row_pitch: f64, right_x: f64) -> Vec<u8> {
+    let mut content = Vec::new();
+    let rows = [("Alpha", "Beta"), ("Gamma", "Delta"), ("Epsilon", "Zeta")];
+    let mut y = 700.0;
+    for (left, right) in rows {
+        emit_line(&mut content, left, 72.0, y, 6.0);
+        emit_line(&mut content, right, right_x, y, 6.0);
+        y -= row_pitch;
+    }
+    wrap_pdf(&content)
+}
+
+fn extract_table(row_pitch: f64, right_x: f64) -> String {
+    let doc = PdfReader::new_with_options(
+        std::io::Cursor::new(build_aligned_table_pdf(row_pitch, right_x)),
+        ParseOptions::lenient(),
+    )
+    .expect("PDF should parse")
+    .into_document();
+    TextExtractor::with_options(ExtractionOptions {
+        reorder_columns: true,
+        ..Default::default()
+    })
+    .extract_from_page(&doc, 0)
+    .expect("extraction should succeed")
+    .text
+}
+
+#[test]
+fn aligned_two_columns_still_reflow_column_major() {
+    // Right cells all start at x=300 → gaps align → block merges → column-major.
+    let text = extract_table(14.0, 300.0);
+    let left_last = text.find("Epsilon").expect("left column present");
+    let right_first = text.find("Beta").expect("right column present");
+    assert!(
+        left_last < right_first,
+        "aligned real columns must still reflow column-major (all left before any \
+         right). The #422 alignment gate must not suppress genuine tables. Got: {text:?}"
+    );
+}
+
+/// Threshold: build a 2-row table whose second row's right cell is offset so the
+/// gap boundary drifts by ~`offset` points from the first row. Within tolerance
+/// (<10) → merges → column-major; outside (>10) → not a block → reading order.
+fn build_two_row_offset_pdf(offset: f64) -> Vec<u8> {
+    let mut content = Vec::new();
+    // Row 1: left "Aa" at 72, right "Bb" at 300.
+    emit_line(&mut content, "Aa", 72.0, 700.0, 6.0);
+    emit_line(&mut content, "Bb", 300.0, 700.0, 6.0);
+    // Row 2: left "Cc" at 72, right "Dd" at 300+offset (left width equal, so the
+    // gap midpoint shifts by offset/2 relative to row 1... use 2*offset so the
+    // boundary shift equals `offset`).
+    emit_line(&mut content, "Cc", 72.0, 686.0, 6.0);
+    emit_line(&mut content, "Dd", 300.0 + 2.0 * offset, 686.0, 6.0);
+    wrap_pdf(&content)
+}
+
+fn extract_two_row(offset: f64) -> String {
+    let doc = PdfReader::new_with_options(
+        std::io::Cursor::new(build_two_row_offset_pdf(offset)),
+        ParseOptions::lenient(),
+    )
+    .expect("PDF should parse")
+    .into_document();
+    TextExtractor::with_options(ExtractionOptions {
+        reorder_columns: true,
+        ..Default::default()
+    })
+    .extract_from_page(&doc, 0)
+    .expect("extraction should succeed")
+    .text
+}
+
+#[test]
+fn aligned_within_tolerance_merges_column_major() {
+    // Boundary drift ~4pt (< 10) → same corridor → merge → column-major:
+    // both left cells (Aa, Cc) before both right cells (Bb, Dd).
+    let text = extract_two_row(2.0);
+    let cc = text.find("Cc").expect("Cc present");
+    let bb = text.find("Bb").expect("Bb present");
+    assert!(
+        cc < bb,
+        "rows within alignment tolerance must merge and reflow column-major \
+         (left column Aa,Cc before right column Bb,Dd). Got: {text:?}"
+    );
+}
+
+#[test]
+fn misaligned_beyond_tolerance_stays_reading_order() {
+    // Boundary drift ~40pt (> 10) → not a shared corridor → not a block →
+    // reading order: row 1 (Aa, Bb) before row 2 (Cc, Dd).
+    let text = extract_two_row(20.0);
+    let bb = text.find("Bb").expect("Bb present");
+    let cc = text.find("Cc").expect("Cc present");
+    assert!(
+        bb < cc,
+        "rows whose gaps drift beyond tolerance must stay in reading order \
+         (row 1 Bb before row 2 Cc), never merged into a false block. Got: {text:?}"
+    );
+}
