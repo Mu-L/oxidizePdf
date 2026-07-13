@@ -1792,6 +1792,24 @@ impl TextExtractor {
             })
         };
 
+        // Two column boundaries within this many points are the same corridor.
+        // Shared by the alignment gate (#422) and the boundary-dedup step below (#403).
+        const COLUMN_ALIGN_TOL: f64 = 10.0;
+
+        // Wide-gap boundary X positions of a line: the midpoint of each internal gap
+        // wider than `column_threshold`. Non-empty iff `line_is_columnar(line)`.
+        let line_boundaries = |line: &[usize]| -> Vec<f64> {
+            let mut bs = Vec::new();
+            for w in line.windows(2) {
+                let (a, b) = (&fragments[w[0]], &fragments[w[1]]);
+                let gap = b.x - (a.x + a.width);
+                if gap > self.options.column_threshold {
+                    bs.push(a.x + a.width + gap / 2.0);
+                }
+            }
+            bs
+        };
+
         // Segment lines into blocks: consecutive columnar lines share one segment
         // id (a multi-line column block); every other line is its own segment.
         // Segment ids are monotonic top-to-bottom, so a later stable sort keyed on
@@ -1799,26 +1817,34 @@ impl TextExtractor {
         let n = fragments.len();
         let mut segment_of = vec![0usize; n];
         let mut column_of = vec![0usize; n];
+
         let mut has_columnar_block = false;
         let mut seg_id = 0usize;
         let mut prev_columnar = false;
         let mut prev_y = f64::INFINITY;
         let mut prev_h = 0.0_f64;
+        let mut prev_boundaries: Vec<f64> = Vec::new();
 
         for (li, line) in lines.iter().enumerate() {
-            let columnar = line_is_columnar(line);
+            let boundaries = line_boundaries(line);
+            let columnar = !boundaries.is_empty();
             let head = &fragments[line[0]];
             // Two consecutive columnar lines share a multi-line column block only
             // when they are spaced like real table rows — at least a line height
             // apart. Tight-leading wrapped prose whose lines each happen to hold a
-            // wide (>`column_threshold`) gap forms a common whitespace corridor and
-            // is geometrically indistinguishable from a 2-column layout; merging it
-            // into a block and reordering column-major shredded the prose (#417).
-            // Below the row-height threshold each such line self-segments instead,
-            // and a single columnar line's column-major order equals its reading
-            // order, so the text is left intact.
+            // wide gap forms a common whitespace corridor and is geometrically
+            // indistinguishable from a 2-column layout; merging it and reordering
+            // column-major shredded the prose (#417).
             let row_spaced = (prev_y - head.y).abs() >= head.height.max(prev_h);
-            if li > 0 && !(columnar && prev_columnar && row_spaced) {
+            // ...and only when their wide gaps ALIGN horizontally. A real column
+            // is a whitespace corridor shared across rows; several unrelated wide
+            // gaps at different X (e.g. a label/value form with varying label
+            // lengths) are not a table. Without this, pooled boundaries from
+            // unaligned gaps shredded any token straddling one (#422).
+            let aligned = prev_boundaries
+                .iter()
+                .any(|&p| boundaries.iter().any(|&c| (p - c).abs() < COLUMN_ALIGN_TOL));
+            if li > 0 && !(columnar && prev_columnar && row_spaced && aligned) {
                 seg_id += 1;
             }
             for &i in line {
@@ -1827,6 +1853,7 @@ impl TextExtractor {
             prev_columnar = columnar;
             prev_y = head.y;
             prev_h = head.height;
+            prev_boundaries = boundaries;
         }
 
         // For each columnar block (a segment whose lines are columnar), derive
@@ -1853,7 +1880,10 @@ impl TextExtractor {
                     let gap = b.x - (a.x + a.width);
                     if gap > self.options.column_threshold {
                         let boundary = a.x + a.width + gap / 2.0;
-                        if !boundaries.iter().any(|&x| (x - boundary).abs() < 10.0) {
+                        if !boundaries
+                            .iter()
+                            .any(|&x| (x - boundary).abs() < COLUMN_ALIGN_TOL)
+                        {
                             boundaries.push(boundary);
                         }
                     }
