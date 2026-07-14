@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `reorder_columns` no longer merges unrelated normal-leading lines that each
+  contain a wide gap at a different X into a false column block, which shredded
+  tokens (e.g. CNPJ identifiers in label/value forms). Column blocks now require
+  the wide gaps to align horizontally across rows (#422).
 - **`reorder_columns` no longer shreds dense prose** (#417, follow-up to #408).
   `detect_and_sort_columns` grouped lines with a fixed `newline_threshold` band
   keyed to the previous fragment, merging tight-leading prose into one
