@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+## [4.1.0] - 2026-07-14
+
+### Added
+
+- **Type 4 (free-form Gouraud triangle mesh) shading** (#407). New public
+  `FreeFormGouraudShading` + `GouraudVertex` (re-exported from `graphics`)
+  emit a Type 4 mesh as a PDF stream per ISO 32000-1 §8.7.4.5.5 — the shading
+  dictionary plus byte-aligned packed vertex data (configurable
+  `BitsPerCoordinate`/`BitsPerComponent`/`BitsPerFlag` and `Decode`). Register
+  on a page with `Page::add_mesh_shading`.
+- **Exact conic (angular) gradient** (#407). New public `ConicShading` emits a
+  Type 1 function-based shading whose `/Function` is a real Type 4 PostScript
+  calculator (angle around a center → colour ramp), so conic gradients are
+  resolution-independent rather than a mesh approximation. Register with
+  `Page::add_conic_shading`. This unblocks lossless `conic-gradient` rendering
+  downstream. The pre-existing hollow `FunctionBasedShading` placeholder is
+  unchanged.
+
+  Both are additive: `ShadingDefinition` and existing types are untouched, so
+  this is a minor release. Folding the new shadings into `ShadingDefinition`
+  and removing the `FunctionBasedShading` placeholder are deferred to the next
+  major.
+
+### Fixed
+
+- `reorder_columns` no longer merges unrelated normal-leading lines that each
+  contain a wide gap at a different X into a false column block, which shredded
+  tokens (e.g. CNPJ identifiers in label/value forms). Column blocks now require
+  the wide gaps to align horizontally across rows (#422).
+- **`reorder_columns` no longer shreds dense prose** (#417, follow-up to #408).
+  `detect_and_sort_columns` grouped lines with a fixed `newline_threshold` band
+  keyed to the previous fragment, merging tight-leading prose into one
+  pseudo-line, and then treated consecutive lines that each held an incidental
+  wide gap as a multi-column table, reordering them column-major and splitting
+  tokens. Line grouping is now head-anchored (matching #408), and a multi-line
+  column block only forms when its rows are at least one line height apart;
+  tighter blocks are left in reading order. Real tables / multi-column layouts
+  are unaffected. Only the opt-in `reorder_columns` / `detect_columns` path was
+  affected.
+
 ## [4.0.1] - 2026-07-12
 
 ### Fixed

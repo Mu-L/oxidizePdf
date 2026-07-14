@@ -44,9 +44,13 @@ pub use separation_color::{
     AlternateColorSpace, SeparationColor, SeparationColorSpace, SpotColors, TintTransform,
 };
 pub use shadings::{
-    AxialShading, ColorStop, FunctionBasedShading, Point, RadialShading, ShadingDefinition,
-    ShadingManager, ShadingPattern, ShadingType,
+    AxialShading, ColorStop, ConicShading, FreeFormGouraudShading, FunctionBasedShading,
+    GouraudVertex, Point, RadialShading, ShadingDefinition, ShadingManager, ShadingPattern,
+    ShadingType,
 };
+// Internal wrapper for the additive mesh/conic shadings registered on a Page;
+// consumed by the writer, not part of the public API.
+pub(crate) use shadings::AdvancedShading;
 pub use soft_mask::{SoftMask, SoftMaskState, SoftMaskType};
 pub use state::{
     BlendMode, ExtGState, ExtGStateFont, ExtGStateManager, Halftone, LineDashPattern,

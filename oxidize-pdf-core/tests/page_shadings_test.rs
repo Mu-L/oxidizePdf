@@ -16,8 +16,8 @@
 //!     from `/Resources/Shading/<Name>`.
 
 use oxidize_pdf::graphics::{
-    AxialShading, Color, ColorStop, FunctionBasedShading, Point as ShadingPoint, RadialShading,
-    ShadingDefinition,
+    AxialShading, Color, ColorStop, ConicShading, FreeFormGouraudShading, FunctionBasedShading,
+    GouraudVertex, Point as ShadingPoint, RadialShading, ShadingDefinition,
 };
 use oxidize_pdf::parser::objects::PdfObject;
 use oxidize_pdf::parser::{ParseOptions, PdfReader};
@@ -398,5 +398,203 @@ fn paint_shading_emits_sh_operator_in_content_stream() {
     assert!(
         content.contains("/Sh1 sh"),
         "content stream must paint the shading with `/Sh1 sh`:\n{content}"
+    );
+}
+
+// ── Issue #407 Phase 3: mesh (Type 4) + conic (Type 1) writer integration ──
+
+/// The exact 3-vertex RGB mesh used across the integration tests (matches the
+/// unit-level packing fixture: 24 bytes, 8 per vertex).
+fn make_mesh() -> FreeFormGouraudShading {
+    FreeFormGouraudShading::new(
+        "Mesh1".to_string(),
+        "DeviceRGB".to_string(),
+        vec![0.0, 100.0, 0.0, 100.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        vec![
+            GouraudVertex {
+                flag: 0,
+                x: 10.0,
+                y: 20.0,
+                color: Color::Rgb(1.0, 0.0, 0.0),
+            },
+            GouraudVertex {
+                flag: 1,
+                x: 50.0,
+                y: 50.0,
+                color: Color::Rgb(0.0, 1.0, 0.0),
+            },
+            GouraudVertex {
+                flag: 1,
+                x: 90.0,
+                y: 10.0,
+                color: Color::Rgb(0.0, 0.0, 1.0),
+            },
+        ],
+    )
+}
+
+fn make_conic() -> ConicShading {
+    ConicShading::new(
+        "Conic1".to_string(),
+        ShadingPoint::new(50.0, 50.0),
+        [0.0, 100.0, 0.0, 100.0],
+        vec![
+            ColorStop::new(0.0, Color::red()),
+            ColorStop::new(1.0, Color::blue()),
+        ],
+    )
+}
+
+const MESH_PACKED_BYTES: [u8; 24] = [
+    0x00, 0x19, 0x9A, 0x33, 0x33, 0xFF, 0x00, 0x00, // v0: flag0, x10, y20, red
+    0x01, 0x80, 0x00, 0x80, 0x00, 0x00, 0xFF, 0x00, // v1: flag1, x50, y50, green
+    0x01, 0xE6, 0x66, 0x19, 0x9A, 0x00, 0x00, 0xFF, // v2: flag1, x90, y10, blue
+];
+
+/// C1: a mesh and a conic registered on the same page both surface under
+/// `/Resources/Shading`. The mesh resolves to an indirect STREAM with
+/// `/ShadingType 4`; the conic resolves to an indirect DICTIONARY with
+/// `/ShadingType 1` whose `/Function` was hoisted to an indirect Type 4
+/// PostScript stream.
+#[test]
+fn page_mesh_and_conic_appear_in_shading_resource() {
+    let mut doc = Document::new();
+    let mut page = Page::a4();
+    page.add_mesh_shading("Mesh1", make_mesh()).expect("mesh");
+    page.add_conic_shading("Conic1", make_conic())
+        .expect("conic");
+    doc.add_page(page);
+
+    let bytes = doc.to_bytes().expect("serialize");
+    let mut reader = PdfReader::new(Cursor::new(&bytes)).expect("parse");
+    let sh = resolve_page0_shading_dict(&mut reader);
+
+    // Mesh → indirect stream, ShadingType 4.
+    let (mn, mg) = sh
+        .get("Mesh1")
+        .and_then(|o| o.as_reference())
+        .expect("/Mesh1 must be an indirect reference");
+    let mesh_obj = reader.get_object(mn, mg).expect("resolve Mesh1").clone();
+    let mesh_stream = mesh_obj
+        .as_stream()
+        .expect("Type 4 mesh must resolve to a stream object");
+    assert_eq!(
+        mesh_stream
+            .dict
+            .get("ShadingType")
+            .and_then(|o| o.as_integer()),
+        Some(4),
+        "mesh /ShadingType must be 4"
+    );
+
+    // Conic → indirect dict, ShadingType 1, /Function hoisted to a stream.
+    let (cn, cg) = sh
+        .get("Conic1")
+        .and_then(|o| o.as_reference())
+        .expect("/Conic1 must be an indirect reference");
+    let conic_obj = reader.get_object(cn, cg).expect("resolve Conic1").clone();
+    let conic_dict = conic_obj.as_dict().expect("conic must resolve to a dict");
+    assert_eq!(
+        conic_dict.get("ShadingType").and_then(|o| o.as_integer()),
+        Some(1),
+        "conic /ShadingType must be 1 (function-based)"
+    );
+    let (fnn, fng) = conic_dict
+        .get("Function")
+        .and_then(|o| o.as_reference())
+        .expect("conic /Function must be an indirect reference, not inline");
+    let func_obj = reader
+        .get_object(fnn, fng)
+        .expect("resolve conic /Function")
+        .clone();
+    let func_stream = func_obj
+        .as_stream()
+        .expect("conic /Function must be a Type 4 PostScript stream");
+    assert_eq!(
+        func_stream
+            .dict
+            .get("FunctionType")
+            .and_then(|o| o.as_integer()),
+        Some(4),
+        "conic /Function must be a Type 4 calculator"
+    );
+}
+
+/// C3: the packed mesh vertex bytes survive the full write → parse pipeline
+/// byte-for-byte (no compression or serialisation corruption).
+#[test]
+fn page_mesh_stream_bytes_survive_roundtrip() {
+    let mut doc = Document::new();
+    let mut page = Page::a4();
+    page.add_mesh_shading("Mesh1", make_mesh()).expect("mesh");
+    doc.add_page(page);
+
+    let bytes = doc.to_bytes().expect("serialize");
+    let mut reader = PdfReader::new(Cursor::new(&bytes)).expect("parse");
+    let sh = resolve_page0_shading_dict(&mut reader);
+    let (mn, mg) = sh
+        .get("Mesh1")
+        .and_then(|o| o.as_reference())
+        .expect("/Mesh1 reference");
+    let mesh_obj = reader.get_object(mn, mg).expect("resolve Mesh1").clone();
+    let stream = mesh_obj.as_stream().expect("mesh stream");
+    let data = stream
+        .decode(&ParseOptions::default())
+        .expect("decode mesh stream");
+    assert_eq!(
+        data,
+        MESH_PACKED_BYTES.to_vec(),
+        "packed mesh vertex bytes must round-trip through the writer unchanged"
+    );
+}
+
+/// C2 regression: the conic PostScript program survives the pipeline with its
+/// angular `atan` operator and both stop colours, decoded from the hoisted
+/// Type 4 function stream (content verification, not a smoke test).
+#[test]
+fn conic_function_stream_contains_atan_and_stop_colors() {
+    let mut doc = Document::new();
+    let mut page = Page::a4();
+    page.add_conic_shading("Conic1", make_conic())
+        .expect("conic");
+    doc.add_page(page);
+
+    let bytes = doc.to_bytes().expect("serialize");
+    let mut reader = PdfReader::new(Cursor::new(&bytes)).expect("parse");
+    let sh = resolve_page0_shading_dict(&mut reader);
+    let (cn, cg) = sh
+        .get("Conic1")
+        .and_then(|o| o.as_reference())
+        .expect("/Conic1 reference");
+    let conic_dict = reader
+        .get_object(cn, cg)
+        .expect("resolve Conic1")
+        .clone()
+        .as_dict()
+        .expect("conic dict")
+        .clone();
+    let (fnn, fng) = conic_dict
+        .get("Function")
+        .and_then(|o| o.as_reference())
+        .expect("conic /Function reference");
+    let func_stream = reader
+        .get_object(fnn, fng)
+        .expect("resolve /Function")
+        .clone();
+    let func_stream = func_stream.as_stream().expect("Type 4 function stream");
+    let code = func_stream
+        .decode(&ParseOptions::default())
+        .expect("decode function stream");
+    let code = String::from_utf8(code).expect("PostScript is ASCII");
+
+    assert!(
+        code.contains("atan"),
+        "conic function must be angular:\n{code}"
+    );
+    // red→blue over DeviceRGB: the ramp encodes deltas (-1, 0, 1) with starts
+    // (1, 0, 0); the "-1 mul 1 add" for the red channel is the tell.
+    assert!(
+        code.contains("-1 mul 1 add"),
+        "conic ramp must carry the red→blue interpolation:\n{code}"
     );
 }
