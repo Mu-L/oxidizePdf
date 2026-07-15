@@ -1829,7 +1829,10 @@ impl TextExtractor {
         let mut prev_columnar = false;
         let mut prev_y = f64::INFINITY;
         let mut prev_h = 0.0_f64;
-        let mut prev_boundaries: Vec<f64> = Vec::new();
+        // Anchor corridors of the CURRENT block: the wide-gap boundaries that
+        // have recurred (within COLUMN_ALIGN_TOL) on *every* line of the block
+        // so far, not just the immediately preceding line.
+        let mut block_boundaries: Vec<f64> = Vec::new();
 
         for (li, line) in lines.iter().enumerate() {
             let boundaries = line_boundaries(line);
@@ -1842,16 +1845,36 @@ impl TextExtractor {
             // indistinguishable from a 2-column layout; merging it and reordering
             // column-major shredded the prose (#417).
             let row_spaced = (prev_y - head.y).abs() >= head.height.max(prev_h);
-            // ...and only when their wide gaps ALIGN horizontally. A real column
-            // is a whitespace corridor shared across rows; several unrelated wide
-            // gaps at different X (e.g. a label/value form with varying label
-            // lengths) are not a table. Without this, pooled boundaries from
-            // unaligned gaps shredded any token straddling one (#422).
-            let aligned = prev_boundaries
+            // ...and only when a wide gap ALIGNS horizontally with the block's
+            // running anchor. A real column is a whitespace corridor shared
+            // across every row; several unrelated wide gaps at different X (a
+            // label/value form with varying label lengths) are not a table.
+            //
+            // Alignment is checked against the whole block, not just the
+            // previous line: a pairwise-only check let unrelated gaps chain
+            // through accumulated drift (line N aligns with N-1, N-1 with N-2,
+            // yet N shares no corridor with the anchor) into one giant block,
+            // scattering a token embedded in that span across the page (#425).
+            // Anchoring to the block — the way sort_and_merge_fragments anchors
+            // line tolerance to the line head (#408) — removes the drift. The
+            // pairwise `prev_boundaries` check that this replaces first landed
+            // for #422; the anchor set subsumes it.
+            let shared: Vec<f64> = block_boundaries
                 .iter()
-                .any(|&p| boundaries.iter().any(|&c| (p - c).abs() < COLUMN_ALIGN_TOL));
-            if li > 0 && !(columnar && prev_columnar && row_spaced && aligned) {
-                seg_id += 1;
+                .copied()
+                .filter(|&p| boundaries.iter().any(|&c| (p - c).abs() < COLUMN_ALIGN_TOL))
+                .collect();
+            if li > 0 && columnar && prev_columnar && row_spaced && !shared.is_empty() {
+                // Line joins the current block; tighten the anchor to the
+                // corridors that persist, so a boundary must recur consistently
+                // across the whole block to survive.
+                block_boundaries = shared;
+            } else {
+                // Break the block: new segment, anchored to this line's own gaps.
+                if li > 0 {
+                    seg_id += 1;
+                }
+                block_boundaries = boundaries;
             }
             for &i in line {
                 segment_of[i] = seg_id;
@@ -1859,7 +1882,6 @@ impl TextExtractor {
             prev_columnar = columnar;
             prev_y = head.y;
             prev_h = head.height;
-            prev_boundaries = boundaries;
         }
 
         // For each columnar block (a segment whose lines are columnar), derive
@@ -1878,21 +1900,43 @@ impl TextExtractor {
                 block_end += 1;
             }
 
-            // Collect boundaries from every line in this block.
-            let mut boundaries = vec![0.0];
+            // A real column boundary is a whitespace corridor that RECURS across
+            // rows. Collect each line's wide-gap midpoints, then keep only
+            // corridors seen on at least two distinct lines (within
+            // COLUMN_ALIGN_TOL). A one-off gap — a single wide space inside
+            // otherwise-flowing text, e.g. the space before a mid-page token —
+            // is not a column; pooling it as a boundary bucketed the token into
+            // a phantom column and relocated its pieces across the block (#425).
+            let mut corridors: Vec<(f64, usize)> = Vec::new(); // (position, line count)
             for line in &lines[block_start..block_end] {
+                // This line's wide-gap corridors, deduped within tolerance so a
+                // line credits each corridor at most once.
+                let mut line_bs: Vec<f64> = Vec::new();
                 for w in line.windows(2) {
                     let (a, b) = (&fragments[w[0]], &fragments[w[1]]);
                     let gap = b.x - (a.x + a.width);
                     if gap > self.options.column_threshold {
-                        let boundary = a.x + a.width + gap / 2.0;
-                        if !boundaries
-                            .iter()
-                            .any(|&x| (x - boundary).abs() < COLUMN_ALIGN_TOL)
-                        {
-                            boundaries.push(boundary);
+                        let bpos = a.x + a.width + gap / 2.0;
+                        if !line_bs.iter().any(|&c| (c - bpos).abs() < COLUMN_ALIGN_TOL) {
+                            line_bs.push(bpos);
                         }
                     }
+                }
+                for bpos in line_bs {
+                    if let Some(entry) = corridors
+                        .iter_mut()
+                        .find(|(c, _)| (*c - bpos).abs() < COLUMN_ALIGN_TOL)
+                    {
+                        entry.1 += 1;
+                    } else {
+                        corridors.push((bpos, 1));
+                    }
+                }
+            }
+            let mut boundaries = vec![0.0];
+            for (pos, count) in &corridors {
+                if *count >= 2 {
+                    boundaries.push(*pos);
                 }
             }
             boundaries.sort_by(|a, b| a.total_cmp(b));
