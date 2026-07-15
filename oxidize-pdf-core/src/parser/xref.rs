@@ -1221,8 +1221,12 @@ impl XRefTable {
                         let before_obj_str = String::from_utf8_lossy(before_obj);
                         let trimmed = before_obj_str.trim_end();
 
-                        if let Some(digit_start) = trimmed.rfind(|c: char| !c.is_ascii_digit()) {
-                            let num_str = trimmed[digit_start + 1..].trim();
+                        if let Some((digit_start, ch)) = trimmed
+                            .char_indices()
+                            .rev()
+                            .find(|(_, c)| !c.is_ascii_digit())
+                        {
+                            let num_str = trimmed[digit_start + ch.len_utf8()..].trim();
                             if !num_str.is_empty() {
                                 if let Ok(obj_num) = num_str.parse::<u32>() {
                                     tracing::debug!(
