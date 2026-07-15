@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+### Fixed
+
+- **Parser panic on malformed input** (#427). `find_catalog_by_content`'s
+  extreme-last-resort catalog scan sliced a `from_utf8_lossy` string at a byte
+  index that could fall inside a multibyte replacement char (U+FFFD), panicking
+  with "not a char boundary". Now advances past the whole char. A recurrence of
+  #93 in a sibling recovery path, surfaced by the new fuzzing harness; the fix
+  itself landed via #428, and the harness's regression fixture guards it here.
+- **Incremental updates resolved to a stale page tree** (#426). When the primary
+  xref was malformed and lenient recovery scanned the file, the recovered
+  object map kept the *first* (oldest) definition of each object number, so a
+  `/Pages` root redefined by an incremental update resolved to the stale
+  revision — silently dropping pages. Recovery now keeps the *last* definition,
+  per ISO 32000-1 §7.5.6 (last-write-wins).
+- **`reorder_columns` scattered tokens across the page** (#425). The block-merge
+  gate only checked each line's column gaps against the immediately preceding
+  line, so unrelated wide gaps chained through accumulated drift into one giant
+  false "columnar block" that bucketed and relocated any token in its span. The
+  gate now anchors alignment to the whole block, and a column boundary must
+  recur across ≥2 rows. Fifth and final failure mode of the column-reorder
+  family (#389, #403, #408, #417, #422).
+
+### Added
+
+- **Coverage-guided fuzzing harness** (`fuzz/`, cargo-fuzz) for the parser and
+  text-extraction pipeline, with a stable regression bridge that replays
+  minimized crashes in the normal test run.
+- **Property-based invariant suites** for text extraction (character
+  conservation, reorder-is-a-permutation, token contiguity, determinism) and
+  the parser (incremental-update last-write-wins), guarding whole bug classes
+  rather than single reported instances.
+
 ## [4.1.0] - 2026-07-14
 
 ### Added

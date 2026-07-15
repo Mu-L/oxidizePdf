@@ -233,7 +233,11 @@ fn read_object_content<R: Read + Seek>(
 /// line-start offset, or `None` if no such header exists. Peak memory is O(chunk).
 ///
 /// First-occurrence semantics match the prior whole-file `find("N 0 obj")` used
-/// by the manual-extraction fallbacks (Issue #339).
+/// by the manual-extraction fallbacks (Issue #339). This is the resolver for
+/// simple manual lookups (e.g. an indirect `/Length` integer); the recovery-path
+/// *reconstruction* that must honour incremental-update last-write-wins
+/// (Issue #426) is handled separately in `merge_object_headers` /
+/// `parse_with_recovery_options`, which keep the latest header per object.
 fn find_object_offset<R: Read + Seek>(reader: &mut R, obj_num: u32) -> ParseResult<Option<u64>> {
     const CHUNK_SIZE: usize = 64 * 1024;
     const CARRY_CAP: usize = 1024;
@@ -1033,23 +1037,10 @@ impl XRefTable {
         table: &mut Self,
     ) -> ParseResult<()> {
         // Bounded-memory scan (Issue #339): locate object headers in fixed-size
-        // chunks instead of reading the entire file into a Vec. Headers are
-        // returned in ascending offset order, so the first definition of a given
-        // object number wins — matching the previous full-buffer behaviour.
-        for header in scan_object_headers(reader)? {
-            if !table.entries.contains_key(&header.obj_num)
-                && !table.extended_entries.contains_key(&header.obj_num)
-            {
-                table.add_entry(
-                    header.obj_num,
-                    XRefEntry {
-                        offset: header.offset,
-                        generation: header.generation,
-                        in_use: true,
-                    },
-                );
-            }
-        }
+        // chunks instead of reading the entire file into a Vec, then add them
+        // with incremental-update last-write-wins semantics (Issue #426).
+        let scanned = scan_object_headers(reader)?;
+        table.add_headers_latest_wins(&scanned, true);
 
         Ok(())
     }
@@ -1073,21 +1064,11 @@ impl XRefTable {
 
         let mut table = Self::new();
 
-        // 1) Locate object headers (bounded scan). The first definition of each
-        //    object number wins, matching the previous full-buffer behaviour.
+        // 1) Locate object headers (bounded scan) and add them with
+        //    incremental-update last-write-wins semantics (ISO 32000-1 §7.5.6,
+        //    Issue #426): a redefined object resolves to its most recent revision.
         let headers = scan_object_headers(reader)?;
-        for h in &headers {
-            if !table.entries.contains_key(&h.obj_num) {
-                table.add_entry(
-                    h.obj_num,
-                    XRefEntry {
-                        offset: h.offset,
-                        generation: h.generation,
-                        in_use: true,
-                    },
-                );
-            }
-        }
+        table.add_headers_latest_wins(&headers, false);
 
         if table.entries.is_empty() {
             return Err(ParseError::InvalidXRef);
@@ -1515,6 +1496,33 @@ impl XRefTable {
     /// Add an entry to the xref table
     pub fn add_entry(&mut self, obj_num: u32, entry: XRefEntry) {
         self.entries.insert(obj_num, entry);
+    }
+
+    /// Add scanned object `headers` with incremental-update semantics: the LAST
+    /// (highest-offset) definition of each object number wins, so an object
+    /// redefined by an appended update resolves to its most recent revision
+    /// (ISO 32000-1 §7.5.6, Issue #426). An entry already resolved from a valid
+    /// xref is never overridden; `check_extended` also protects compressed-object
+    /// (`extended_entries`) resolutions. `headers` is assumed ascending by offset.
+    fn add_headers_latest_wins(&mut self, headers: &[ObjHeader], check_extended: bool) {
+        let mut latest: HashMap<u32, &ObjHeader> = HashMap::new();
+        for h in headers {
+            latest.insert(h.obj_num, h); // ascending ⇒ last wins
+        }
+        for (obj_num, h) in latest {
+            let occupied = self.entries.contains_key(&obj_num)
+                || (check_extended && self.extended_entries.contains_key(&obj_num));
+            if !occupied {
+                self.add_entry(
+                    obj_num,
+                    XRefEntry {
+                        offset: h.offset,
+                        generation: h.generation,
+                        in_use: true,
+                    },
+                );
+            }
+        }
     }
 
     /// Set the trailer dictionary
