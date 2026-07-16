@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+### Security
+
+- **Owner-password unlock fail-open and its fail-safe twin (#430).** The RC4/MD5
+  owner-unlock path (R2-R4) decrypted `/O` to the 32-byte padded user password,
+  then reconstructed a string by truncating at the first standard-padding byte
+  (`0x28`, `(`). Two faults, one root cause: (a) a **fail-open** — with a wrong
+  owner password the 32 bytes are garbage, and whenever the first byte was
+  `0x28` the derived password collapsed to `""`, which re-padded to the standard
+  padding and authenticated any document with an empty user password, granting
+  owner access on ~1/256 of wrong attempts; (b) **#430**, a fail-safe twin —
+  a legitimate user password of `(` also truncated to `""`, so the correct owner
+  password no longer unlocked. The path now runs the decrypted bytes through the
+  standard `/U` verifier (ISO 32000-1 §7.6.3.4, Algorithm 3) with no truncation,
+  closing both. Also hardened owner unlock against a short `/O` (was a reachable
+  panic). Found by the encryption round-trip invariant, not a field report.
+
 ### Fixed
 
 - **Two parser panics on malformed page dictionaries.** The manual recovery

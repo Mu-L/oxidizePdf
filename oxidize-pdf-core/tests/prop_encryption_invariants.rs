@@ -73,29 +73,69 @@ fn marker() -> impl Strategy<Value = String> {
     "[A-Za-z0-9]{4,24}"
 }
 
-// Passwords: alphanumeric. User may be empty (#379); owner is non-empty (the
-// standard case). PDF-delimiter characters (`(`, `)`, `\`) are deliberately
-// excluded here because they currently break owner-password unlock (#430);
-// that case is pinned separately below as an `#[ignore]`d regression.
+// Passwords: alphanumeric plus the PDF string delimiters `(`, `)`, `\` and a
+// space. User may be empty (#379); owner is non-empty (the standard case). The
+// delimiters are included on purpose: they exercise the `/O`/`/U` bytes that
+// #430 and the owner-unlock fail-open both mishandled, so keeping them in the
+// generator guards that both stay fixed.
 fn user_pw() -> impl Strategy<Value = String> {
-    "[A-Za-z0-9]{0,16}"
+    r"[A-Za-z0-9()\\ ]{0,16}"
 }
 fn owner_pw() -> impl Strategy<Value = String> {
-    "[A-Za-z0-9]{1,16}"
+    r"[A-Za-z0-9()\\ ]{1,16}"
 }
 
-/// Known-failing pin for #430: a `(` in the user password breaks owner-password
-/// unlock (the `/O`/`/U` password bytes are mis-escaped in the `/Encrypt` dict).
-/// Ignored until #430 is fixed; removing `#[ignore]` then turns it into a guard.
+/// Guard for #430: a `(` in the user password used to break owner-password
+/// unlock. Root cause was shared with the owner-unlock fail-open below — the old
+/// owner path truncated the decrypted `/O` bytes at the first `0x28` ('('), so a
+/// user password of `(` collapsed to `""` and the correct owner password no
+/// longer matched. Authenticating the raw 32 padded bytes (the fix) resolves
+/// both. Formerly `#[ignore]`d as blocked-on-#430; now a permanent guard.
 #[test]
-#[ignore = "blocked on #430: PDF-delimiter char in user password breaks owner unlock"]
 fn issue_430_paren_in_user_password_owner_unlock() {
-    let bytes = build_encrypted("MARKER", "(", "owner", EncryptionStrength::Rc4_40bit);
-    let mut reader = PdfReader::new(Cursor::new(bytes)).expect("parse");
-    assert!(
-        reader.unlock_with_password("owner").expect("unlock call"),
-        "owner password must unlock even when the user password contains '(' (#430)"
-    );
+    for strength in [
+        EncryptionStrength::Rc4_40bit,
+        EncryptionStrength::Rc4_128bit,
+        EncryptionStrength::Aes128,
+    ] {
+        let bytes = build_encrypted("MARKER", "(", "owner", strength);
+        let mut reader = PdfReader::new(Cursor::new(bytes)).expect("parse");
+        assert!(
+            reader.unlock_with_password("owner").expect("unlock call"),
+            "owner password must unlock when the user password contains '(' ({strength:?}, #430)"
+        );
+    }
+}
+
+/// Deterministic guard for the owner-unlock fail-open: a wrong password must not
+/// authenticate as owner. The R2-R4 owner path decrypts `/O` to the padded user
+/// password, then (before the fix) searched for where the standard padding began
+/// (`0x28`, `(`) and truncated there. With a wrong password the 32 decrypted
+/// bytes are garbage; whenever the first byte happened to be `0x28` the derived
+/// password collapsed to `""`, which re-padded to the exact standard padding and
+/// so authenticated any document with an **empty** user password — granting
+/// owner-level access on ~1/256 of wrong attempts. The fix runs the decrypted
+/// bytes through the standard user-auth (ISO 32000-1 §7.6.3.4, Alg. 3) with no
+/// truncation. This input is a concrete wrong password that opened before it.
+#[test]
+fn wrong_owner_password_never_grants_access_with_empty_user_pw() {
+    let owner = "ladLlQaGYZ";
+    // Wrong password whose `/O` decryption yields a `0x28` first byte (the shrunk
+    // proptest counterexample). Differs from both "" (user) and owner.
+    let wrong = format!("\u{1}wrong\u{2}{owner}");
+    for strength in [
+        EncryptionStrength::Rc4_40bit,
+        EncryptionStrength::Rc4_128bit,
+        EncryptionStrength::Aes128,
+    ] {
+        let bytes = build_encrypted("000a", "", owner, strength);
+        let mut reader = PdfReader::new(Cursor::new(bytes)).expect("parse");
+        assert!(reader.is_encrypted());
+        assert!(
+            !reader.unlock_with_password(&wrong).expect("unlock call"),
+            "a wrong password must not unlock an empty-user-password doc ({strength:?})"
+        );
+    }
 }
 
 proptest! {
