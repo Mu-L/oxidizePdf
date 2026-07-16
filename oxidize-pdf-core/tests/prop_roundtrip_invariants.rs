@@ -4,6 +4,8 @@
 //! (preserved-font collision), #156 (SMask dropped). One property per
 //! dimension + a deterministic issue_N pin per class.
 
+use oxidize_pdf::graphics::Image;
+use oxidize_pdf::parser::objects::{PdfName, PdfObject};
 use oxidize_pdf::parser::{PdfDocument, PdfReader};
 use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
 use oxidize_pdf::{Document, Font, Page};
@@ -53,6 +55,63 @@ fn page_base_fonts(page_index: u32, doc: &PdfDocument<Cursor<Vec<u8>>>) -> Vec<S
         }
     }
     out
+}
+
+/// Build a one-page doc with an RGBA image drawn on it. Returns None if the
+/// image has no transparency (the SMask invariant then does not apply).
+fn build_rgba_image_doc(w: u32, h: u32, rgba: Vec<u8>) -> Option<Vec<u8>> {
+    let image = Image::from_rgba_data(rgba, w, h).ok()?;
+    if !image.has_transparency() {
+        return None;
+    }
+    let mut doc = Document::new();
+    let mut page = Page::a4();
+    page.add_image("Img", image);
+    page.draw_image("Img", 100.0, 100.0, w as f64, h as f64)
+        .expect("draw");
+    doc.add_page(page);
+    Some(doc.to_bytes().expect("serialize"))
+}
+
+/// For each image XObject on the page, whether its /SMask resolves to a stream.
+/// Mirrors the walk in overlay_smask_test.rs.
+fn page_xobject_smask_flags(page_index: u32, doc: &PdfDocument<Cursor<Vec<u8>>>) -> Vec<bool> {
+    let page = doc.get_page(page_index).expect("get_page");
+    let resources = match page.get_resources() {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let xobj = match resources
+        .get("XObject")
+        .map(|o| doc.resolve(o).expect("resolve xobj"))
+    {
+        Some(PdfObject::Dictionary(d)) => d,
+        _ => return Vec::new(),
+    };
+    let mut flags = Vec::new();
+    for (_name, obj) in xobj.0.iter() {
+        if let PdfObject::Stream(stream) = doc.resolve(obj).expect("resolve stream") {
+            // Only image XObjects carry /SMask.
+            let is_image = stream
+                .dict
+                .get("Subtype")
+                .and_then(|s| s.as_name())
+                .map(|n| n.0 == "Image")
+                .unwrap_or(false);
+            if !is_image {
+                continue;
+            }
+            let smask_is_stream = match stream.dict.0.get(&PdfName::new("SMask".to_string())) {
+                Some(sm) => matches!(
+                    doc.resolve(sm).expect("resolve smask"),
+                    PdfObject::Stream(_)
+                ),
+                None => false,
+            };
+            flags.push(smask_is_stream);
+        }
+    }
+    flags
 }
 
 /// Append one A4 page carrying a single text marker at a fixed position.
@@ -131,6 +190,31 @@ proptest! {
                 );
             }
         }
+    }
+
+    /// An image with transparency keeps a resolvable /SMask through the
+    /// round-trip (#156).
+    #[test]
+    fn image_smask_preserved(w in 2u32..=16, h in 2u32..=16, seed in any::<u64>()) {
+        // Deterministic RGBA from the seed; pixel 0 is fully transparent so the
+        // image always has an alpha channel (and thus a soft mask).
+        let n = (w * h) as usize;
+        let mut rgba = Vec::with_capacity(n * 4);
+        let mut s = seed | 1;
+        for i in 0..n {
+            for _ in 0..3 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                rgba.push((s >> 33) as u8);
+            }
+            rgba.push(if i == 0 { 0 } else { ((s >> 40) as u8) | 1 });
+        }
+        let Some(bytes) = build_rgba_image_doc(w, h, rgba) else {
+            return Ok(()); // no transparency (shouldn't happen given alpha=0 above)
+        };
+        let document = reparse(bytes);
+        let flags = page_xobject_smask_flags(0, &document);
+        prop_assert!(!flags.is_empty(), "no image XObject found after round-trip");
+        prop_assert!(flags.iter().all(|&f| f), "an image lost its /SMask: {flags:?}");
     }
 }
 
@@ -247,4 +331,25 @@ fn issue_395_two_distinct_embedded_fonts_no_collision() {
         bases.iter().any(|b| b.contains("SourceSans")),
         "#395: SourceSans collapsed or lost: {bases:?}"
     );
+}
+
+/// #156 pin: an RGBA image with partial alpha keeps a resolvable /SMask stream.
+#[test]
+fn issue_156_rgba_image_keeps_smask() {
+    // 2x2 RGBA, one fully transparent pixel.
+    let rgba = vec![
+        255, 0, 0, 0, // transparent red
+        0, 255, 0, 128, // semi green
+        0, 0, 255, 200, // mostly blue
+        255, 255, 0, 255, // opaque yellow
+    ];
+    let bytes = build_rgba_image_doc(2, 2, rgba).expect("image has transparency");
+    let document = reparse(bytes);
+    let flags = page_xobject_smask_flags(0, &document);
+    assert_eq!(
+        flags.len(),
+        1,
+        "#156: expected exactly one image XObject: {flags:?}"
+    );
+    assert!(flags[0], "#156: image lost its /SMask after round-trip");
 }
