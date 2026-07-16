@@ -5,7 +5,7 @@
 //! dimension + a deterministic issue_N pin per class.
 
 use oxidize_pdf::graphics::Image;
-use oxidize_pdf::parser::objects::{PdfName, PdfObject};
+use oxidize_pdf::parser::objects::PdfObject;
 use oxidize_pdf::parser::{PdfDocument, PdfReader};
 use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
 use oxidize_pdf::{Document, Font, Page};
@@ -58,7 +58,9 @@ fn page_base_fonts(page_index: u32, doc: &PdfDocument<Cursor<Vec<u8>>>) -> Vec<S
 }
 
 /// Build a one-page doc with an RGBA image drawn on it. Returns None if the
-/// image has no transparency (the SMask invariant then does not apply).
+/// image reports no transparency — a defensive guard, since `from_rgba_data`
+/// always attaches an alpha channel today, so this branch does not fire for the
+/// current generator; it keeps the invariant honest if that ever changes.
 fn build_rgba_image_doc(w: u32, h: u32, rgba: Vec<u8>) -> Option<Vec<u8>> {
     let image = Image::from_rgba_data(rgba, w, h).ok()?;
     if !image.has_transparency() {
@@ -101,7 +103,7 @@ fn page_xobject_smask_flags(page_index: u32, doc: &PdfDocument<Cursor<Vec<u8>>>)
             if !is_image {
                 continue;
             }
-            let smask_is_stream = match stream.dict.0.get(&PdfName::new("SMask".to_string())) {
+            let smask_is_stream = match stream.dict.get("SMask") {
                 Some(sm) => matches!(
                     doc.resolve(sm).expect("resolve smask"),
                     PdfObject::Stream(_)
@@ -169,11 +171,26 @@ proptest! {
     /// Every written marker is recoverable from its page's extracted text (#364).
     #[test]
     fn text_content_preserved(
-        pages in prop::collection::vec(
+        raw in prop::collection::vec(
             prop::collection::vec(marker(), 1..=3),
             1..=4,
         ),
     ) {
+        // Prefix each marker with its per-page index (`M{j}_`). The generated
+        // markers never contain '_', so `M{j}_...` matches exactly one marker
+        // and no marker can be a substring of another on the same page — a
+        // `contains` check would otherwise pass for a dropped marker that another
+        // one happens to embed (e.g. "Ab12" inside "XAb12Y").
+        let pages: Vec<Vec<String>> = raw
+            .iter()
+            .map(|markers| {
+                markers
+                    .iter()
+                    .enumerate()
+                    .map(|(j, m)| format!("M{j}_{m}"))
+                    .collect()
+            })
+            .collect();
         let bytes = build_text_pages(&pages);
         let document = reparse(bytes);
         let mut extractor = TextExtractor::with_options(ExtractionOptions::default());
@@ -196,8 +213,9 @@ proptest! {
     /// round-trip (#156).
     #[test]
     fn image_smask_preserved(w in 2u32..=16, h in 2u32..=16, seed in any::<u64>()) {
-        // Deterministic RGBA from the seed; pixel 0 is fully transparent so the
-        // image always has an alpha channel (and thus a soft mask).
+        // Deterministic RGBA from the seed. `from_rgba_data` always attaches an
+        // alpha channel (so the writer always emits an /SMask); pixel 0 is forced
+        // to alpha=0 only to keep the data visibly non-opaque for a reader.
         let n = (w * h) as usize;
         let mut rgba = Vec::with_capacity(n * 4);
         let mut s = seed | 1;
