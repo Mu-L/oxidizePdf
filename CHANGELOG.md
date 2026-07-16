@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
-## [Unreleased]
+## [4.1.1] - 2026-07-16
 
 ### Security
 
@@ -64,10 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Coverage-guided fuzzing harness** (`fuzz/`, cargo-fuzz) for the parser and
   text-extraction pipeline, with a stable regression bridge that replays
   minimized crashes in the normal test run.
-- **Property-based invariant suites** for text extraction (character
-  conservation, reorder-is-a-permutation, token contiguity, determinism) and
-  the parser (incremental-update last-write-wins), guarding whole bug classes
-  rather than single reported instances.
+- **Property-based invariant suites** guarding whole bug classes rather than
+  single reported instances: text extraction (character conservation,
+  reorder-is-a-permutation, token contiguity, determinism), the parser
+  (incremental-update last-write-wins; never-panic over arbitrary, mutated, and
+  truncated bytes across all strictness modes), fonts (measured glyph width
+  matches the real metric; WinAnsi round-trip), and encryption (user/owner
+  password round-trip and wrong-password-never-unlocks, across RC4-40/128 and
+  AES-128/256). Several of these caught unreported defects before release.
 
 ## [4.1.0] - 2026-07-14
 
