@@ -1,0 +1,15 @@
+# cargo-fuzz build output
+/target
+/Cargo.lock
+
+# Coverage-guided corpus grown by libFuzzer at runtime. Seeds live under
+# corpus/<target>/ and ARE committed (they are small, curated real PDFs);
+# everything libFuzzer discovers on top is machine-generated and ignored.
+/corpus/*/*
+!/corpus/*/.gitkeep
+!/corpus/*/seed_*
+
+# Crash / timeout / OOM artifacts. When one is found, minimize it and promote
+# it into oxidize-pdf-core/tests/fixtures/fuzz-regressions/ (see README), do not
+# commit the raw artifact here.
+/artifacts

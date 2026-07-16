@@ -1,0 +1,247 @@
+//! Core invariants of text extraction, stated from the *contract* of "extract
+//! the text that was drawn" — NOT reverse-engineered from any single bug report.
+//! Each property is checked against hundreds of randomized layouts, so the whole
+//! class it describes is guarded before the first report, and every future edit
+//! to the extraction pipeline is re-checked against it.
+//!
+//! Invariants:
+//!   1. CONSERVATION — every glyph drawn on the page appears in the extracted
+//!      text. Extraction may add separators (spaces/newlines) but must never
+//!      silently drop a character. Guards the "returns empty / drops content /
+//!      renders '?'" class (#330, #392, #415).
+//!   2. REORDER IS A PERMUTATION — `reorder_columns` rearranges glyphs; it must
+//!      never add, drop, or mutate one. The non-whitespace character multiset is
+//!      identical with reordering off and on.
+//!   3. TOKEN CONTIGUITY UNDER REORDER — a token contiguous in reading order
+//!      stays contiguous after reordering. Guards the column-shredding family
+//!      (#389, #403, #408, #417, #422, #425). (Distinct from #2: scattering a
+//!      token preserves the character multiset but breaks contiguity.)
+//!   4. DETERMINISM — extracting the same bytes twice yields identical text.
+
+use oxidize_pdf::parser::{ParseOptions, PdfReader};
+use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
+use proptest::prelude::*;
+use std::collections::BTreeMap;
+use std::io::{Cursor, Write};
+
+const FONT_SIZE: f64 = 9.0;
+const GLYPH_ADVANCE: f64 = FONT_SIZE * 0.5;
+const LEADING: f64 = 13.0;
+
+const WORDS: [&str; 10] = [
+    "lorem", "ipsum", "dolor", "amet", "sed", "tempor", "labore", "aliqua", "quis", "nostrud",
+];
+
+fn escape(ch: char) -> String {
+    match ch {
+        '(' => "\\(".to_string(),
+        ')' => "\\)".to_string(),
+        '\\' => "\\\\".to_string(),
+        _ => ch.to_string(),
+    }
+}
+
+fn emit_glyphs(content: &mut Vec<u8>, text: &str, start_x: f64, y: f64) -> f64 {
+    let mut x = start_x;
+    for ch in text.chars() {
+        let e = escape(ch);
+        content.extend_from_slice(
+            format!("BT\n/F1 {FONT_SIZE} Tf\n{x:.2} {y:.2} Td\n({e}) Tj\nET\n").as_bytes(),
+        );
+        x += GLYPH_ADVANCE;
+    }
+    x
+}
+
+fn wrap_pdf(content: &[u8]) -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n");
+    offsets.push(pdf.len());
+    let mut obj4 = Vec::new();
+    write!(obj4, "4 0 obj\n<< /Length {} >>\nstream\n", content.len()).unwrap();
+    obj4.extend_from_slice(content);
+    obj4.extend_from_slice(b"\nendstream\nendobj\n");
+    pdf.extend_from_slice(&obj4);
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+    let xref_pos = pdf.len();
+    write!(pdf, "xref\n0 6\n0000000000 65535 f \n").unwrap();
+    for off in &offsets {
+        write!(pdf, "{off:010} 00000 n \n").unwrap();
+    }
+    write!(
+        pdf,
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n"
+    )
+    .unwrap();
+    pdf
+}
+
+fn extract(pdf: &[u8], reorder: bool) -> String {
+    let reader = PdfReader::new_with_options(Cursor::new(pdf.to_vec()), ParseOptions::lenient())
+        .expect("parse");
+    let document = reader.into_document();
+    let mut extractor = TextExtractor::with_options(ExtractionOptions {
+        reorder_columns: reorder,
+        detect_columns: reorder,
+        ..Default::default()
+    });
+    extractor
+        .extract_from_page(&document, 0)
+        .expect("extract")
+        .text
+}
+
+/// Multiset of non-whitespace characters.
+fn char_counts(s: &str) -> BTreeMap<char, usize> {
+    let mut m = BTreeMap::new();
+    for c in s.chars().filter(|c| !c.is_whitespace()) {
+        *m.entry(c).or_insert(0) += 1;
+    }
+    m
+}
+
+/// Build a random page and return (pdf_bytes, drawn_text). Some lines carry a
+/// wide column gap so the column-detection path is exercised; words never
+/// exactly overlap, so every drawn glyph is unambiguously recoverable.
+fn build_page(spec: &[(Vec<usize>, Option<usize>)]) -> (Vec<u8>, String) {
+    let mut content = Vec::new();
+    let mut drawn = String::new();
+    let mut y = 760.0;
+    for (word_idxs, gap_before) in spec {
+        let mut x = 50.0;
+        for (pos, &wi) in word_idxs.iter().enumerate() {
+            // A gap corridor before word `gap_before` exercises columns.
+            if Some(pos) == *gap_before {
+                x += 70.0; // > column_threshold (50)
+            }
+            let w = WORDS[wi % WORDS.len()];
+            x = emit_glyphs(&mut content, w, x, y);
+            drawn.push_str(w);
+            x += 8.0;
+        }
+        y -= LEADING;
+    }
+    (wrap_pdf(&content), drawn)
+}
+
+// ---- Drift-chain builder for the #425 token-contiguity property. ----------
+
+fn build_drift_page(n_lines: usize, token_line: usize, token: &str, drift_step: f64) -> Vec<u8> {
+    const GAP_BASE: f64 = 150.0;
+    let leaders = ["ab", "cd"];
+    let mut content = Vec::new();
+    let mut y = 760.0;
+    for i in 0..n_lines {
+        let mut x = 50.0;
+        for w in leaders {
+            x = emit_glyphs(&mut content, w, x, y);
+            x += 8.0;
+        }
+        let gap_x = GAP_BASE + (i as f64) * drift_step;
+        if i == token_line {
+            emit_glyphs(&mut content, token, gap_x, y);
+        } else {
+            emit_glyphs(&mut content, "filler", gap_x, y);
+        }
+        y -= LEADING;
+    }
+    wrap_pdf(&content)
+}
+
+/// Deterministic pin for #425: a drift chain that scatters a token.
+#[test]
+fn issue_425_drift_chain_does_not_split_token() {
+    const TOKEN: &str = "12.345.678/0001-99";
+    let pdf = build_drift_page(30, 6, TOKEN, 8.0);
+    let flat = extract(&pdf, false);
+    let reordered = extract(&pdf, true);
+    assert!(flat.contains(TOKEN), "token intact without reorder\n{flat}");
+    assert!(
+        reordered.contains(TOKEN),
+        "reorder split the token (#425)\n--- flat ---\n{flat}\n--- reordered ---\n{reordered}"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// INV-1 CONSERVATION: every drawn glyph appears in the extracted text.
+    #[test]
+    fn conservation_no_glyph_dropped(
+        spec in prop::collection::vec(
+            (prop::collection::vec(0usize..10, 2..7), prop::option::of(1usize..4)),
+            3..25,
+        ),
+    ) {
+        let (pdf, drawn) = build_page(&spec);
+        let flat = extract(&pdf, false);
+        let want = char_counts(&drawn);
+        let got = char_counts(&flat);
+        for (ch, n) in want {
+            let g = got.get(&ch).copied().unwrap_or(0);
+            prop_assert!(
+                g >= n,
+                "dropped glyph {:?}: drawn {} times, extracted {}\n{}",
+                ch, n, g, flat
+            );
+        }
+    }
+
+    /// INV-2 REORDER IS A PERMUTATION: same non-whitespace multiset off vs on.
+    #[test]
+    fn reorder_is_a_permutation(
+        spec in prop::collection::vec(
+            (prop::collection::vec(0usize..10, 2..7), prop::option::of(1usize..4)),
+            3..25,
+        ),
+    ) {
+        let (pdf, _) = build_page(&spec);
+        let flat = char_counts(&extract(&pdf, false));
+        let reordered = char_counts(&extract(&pdf, true));
+        prop_assert_eq!(flat, reordered, "reorder changed the character multiset");
+    }
+
+    /// INV-3 TOKEN CONTIGUITY UNDER REORDER (the #425 class).
+    #[test]
+    fn reorder_never_splits_a_token(
+        n_lines in 15usize..40,
+        token_line in 2usize..12,
+        drift_step in 3.0f64..9.5,
+        token in "[0-9]{2,4}[./-][0-9]{2,4}[./-][0-9]{2,4}",
+    ) {
+        let token_line = token_line.min(n_lines - 1);
+        let pdf = build_drift_page(n_lines, token_line, &token, drift_step);
+        let flat = extract(&pdf, false);
+        if flat.contains(token.as_str()) {
+            let reordered = extract(&pdf, true);
+            prop_assert!(
+                reordered.contains(token.as_str()),
+                "reorder split token {:?}\n--- flat ---\n{}\n--- reordered ---\n{}",
+                token, flat, reordered
+            );
+        }
+    }
+
+    /// INV-4 DETERMINISM: extracting the same bytes twice is identical.
+    #[test]
+    fn extraction_is_deterministic(
+        spec in prop::collection::vec(
+            (prop::collection::vec(0usize..10, 2..7), prop::option::of(1usize..4)),
+            3..25,
+        ),
+        reorder in any::<bool>(),
+    ) {
+        let (pdf, _) = build_page(&spec);
+        prop_assert_eq!(extract(&pdf, reorder), extract(&pdf, reorder));
+    }
+}

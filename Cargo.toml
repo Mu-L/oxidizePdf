@@ -4,13 +4,14 @@ members = [
 ]
 exclude = [
     "lints",  # Dylint lints workspace (requires nightly)
+    "fuzz",   # cargo-fuzz / libFuzzer harness (requires nightly)
     "dev-tools/iso-curator",  # ISO matrix curation tool (standalone)
     "dev-tools/pipeline-profiler",  # Pipeline profiler (standalone)
 ]
 resolver = "2"
 
 [workspace.package]
-version = "4.1.0"
+version = "4.1.1"
 edition = "2021"
 rust-version = "1.88"  # MSRV - dependency floor: subprocess (let-chains), image 0.25.10, time 0.3.47 all require 1.88
 authors = ["Santiago Fernández Muñoz"]

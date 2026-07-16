@@ -58,6 +58,65 @@ fn is_immediate_stream_start(data: &[u8]) -> bool {
     data[i..].starts_with(b"stream")
 }
 
+/// Content between the first `open` byte and the first `close` byte that
+/// **follows** it, both exclusive. `None` when either delimiter is absent, or
+/// when `close` occurs only before `open`.
+///
+/// Searching the closer in the remainder after the opener is what makes this
+/// total: a naive `find(open)` + `find(close)` over the same haystack inverts
+/// the range on input like `/MediaBox ][` and panics. Both delimiters must be
+/// ASCII, so a match can never land inside a multi-byte UTF-8 sequence and the
+/// returned bounds are always char boundaries.
+fn slice_between(haystack: &str, open: u8, close: u8) -> Option<&str> {
+    debug_assert!(open.is_ascii() && close.is_ascii());
+    let open_idx = haystack.as_bytes().iter().position(|&b| b == open)?;
+    let rest = &haystack[open_idx + 1..];
+    let close_idx = rest.as_bytes().iter().position(|&b| b == close)?;
+    Some(&rest[..close_idx])
+}
+
+/// Byte offset, relative to `after`, of the `>>` that closes a dictionary whose
+/// opening `<<` has already been consumed. `None` if it never closes.
+///
+/// `after` is text recovered from arbitrary bytes via `from_utf8_lossy`, so it
+/// routinely holds multi-byte `U+FFFD`. The scan therefore stays in byte space
+/// throughout: `<` and `>` are ASCII and cannot occur inside a multi-byte
+/// sequence, which keeps the returned offset a valid slice bound. Mixing char
+/// indices with byte indices here splits a `U+FFFD` and panics.
+fn find_dict_end(after: &str) -> Option<usize> {
+    let bytes = after.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0usize;
+
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'>' && bytes[i + 1] == b'>' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Prefix of `s` of at most `max_bytes`, cut back to the nearest char boundary.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// High-level PDF reader
 pub struct PdfReader<R: Read + Seek> {
     reader: BufReader<R>,
@@ -1268,7 +1327,7 @@ impl<R: Read + Seek> PdfReader<R> {
                     let after_n = &content[n_pos + 3..];
                     tracing::debug!(
                         "Content after /N: {}",
-                        &after_n[..std::cmp::min(50, after_n.len())]
+                        truncate_on_char_boundary(after_n, 50)
                     );
 
                     // Extract the number that follows /N
@@ -1408,24 +1467,20 @@ impl<R: Read + Seek> PdfReader<R> {
         // Parse MediaBox: [ 0 0 612 792 ]
         if let Some(mediabox_start) = dict_content.find("/MediaBox") {
             let mediabox_area = &dict_content[mediabox_start..];
-            if let Some(start_bracket) = mediabox_area.find("[") {
-                if let Some(end_bracket) = mediabox_area.find("]") {
-                    let mediabox_content = &mediabox_area[start_bracket + 1..end_bracket];
-                    let values: Vec<f32> = mediabox_content
-                        .split_whitespace()
-                        .filter_map(|s| s.parse().ok())
-                        .collect();
+            if let Some(mediabox_content) = slice_between(mediabox_area, b'[', b']') {
+                let values: Vec<f32> = mediabox_content
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
 
-                    if values.len() == 4 {
-                        let mediabox = PdfArray(vec![
-                            PdfObject::Integer(values[0] as i64),
-                            PdfObject::Integer(values[1] as i64),
-                            PdfObject::Integer(values[2] as i64),
-                            PdfObject::Integer(values[3] as i64),
-                        ]);
-                        result_dict
-                            .insert(PdfName("MediaBox".to_string()), PdfObject::Array(mediabox));
-                    }
+                if values.len() == 4 {
+                    let mediabox = PdfArray(vec![
+                        PdfObject::Integer(values[0] as i64),
+                        PdfObject::Integer(values[1] as i64),
+                        PdfObject::Integer(values[2] as i64),
+                        PdfObject::Integer(values[3] as i64),
+                    ]);
+                    result_dict.insert(PdfName("MediaBox".to_string()), PdfObject::Array(mediabox));
                 }
             }
         }
@@ -1790,30 +1845,10 @@ impl<R: Read + Seek> PdfReader<R> {
         if let Some(start) = content.find(&pattern) {
             let search_area = &content[start..];
             if let Some(dict_start) = search_area.find("<<") {
-                // Handle nested dictionaries properly
-                let mut bracket_count = 1;
-                let mut pos = dict_start + 2;
-                let bytes = search_area.as_bytes();
-                let mut dict_end = None;
+                let after_bracket = &search_area[dict_start + 2..];
 
-                while pos < bytes.len() - 1 && bracket_count > 0 {
-                    if bytes[pos] == b'<' && bytes[pos + 1] == b'<' {
-                        bracket_count += 1;
-                        pos += 2;
-                    } else if bytes[pos] == b'>' && bytes[pos + 1] == b'>' {
-                        bracket_count -= 1;
-                        if bracket_count == 0 {
-                            dict_end = Some(pos);
-                            break;
-                        }
-                        pos += 2;
-                    } else {
-                        pos += 1;
-                    }
-                }
-
-                if let Some(dict_end) = dict_end {
-                    let dict_content = &search_area[dict_start + 2..dict_end];
+                if let Some(dict_end) = find_dict_end(after_bracket) {
+                    let dict_content = &after_bracket[..dict_end];
 
                     // Manually parse the object content based on object number
                     let mut result_dict = HashMap::new();
@@ -2431,28 +2466,11 @@ impl<R: Read + Seek> PdfReader<R> {
             if let Some(bracket_start) = dict_content[resources_start..].find("<<") {
                 let abs_bracket_start = resources_start + bracket_start + 2;
 
-                // Find matching closing bracket - simple nesting counter
-                let mut bracket_count = 1;
-                let mut end_pos = abs_bracket_start;
-                let chars: Vec<char> = dict_content.chars().collect();
-
-                while end_pos < chars.len() && bracket_count > 0 {
-                    if end_pos + 1 < chars.len() {
-                        if chars[end_pos] == '<' && chars[end_pos + 1] == '<' {
-                            bracket_count += 1;
-                            end_pos += 2;
-                            continue;
-                        } else if chars[end_pos] == '>' && chars[end_pos + 1] == '>' {
-                            bracket_count -= 1;
-                            end_pos += 2;
-                            continue;
-                        }
-                    }
-                    end_pos += 1;
-                }
-
-                if bracket_count == 0 {
-                    let resources_content = &dict_content[abs_bracket_start..end_pos - 2];
+                // Find the matching `>>`, counting nesting. Offset is relative
+                // to the text after the opening `<<`.
+                let after_bracket = &dict_content[abs_bracket_start..];
+                if let Some(end_rel) = find_dict_end(after_bracket) {
+                    let resources_content = &after_bracket[..end_rel];
 
                     // Parse basic Resources structure
                     let mut resources_dict = HashMap::new();
@@ -3217,6 +3235,92 @@ mod tests {
         let cursor = Cursor::new(pdf_data);
         let result = PdfReader::new(cursor);
         assert!(result.is_ok());
+    }
+
+    // --- Total string-slicing helpers used by the manual recovery path ---
+    //
+    // The recovery path builds these from `String::from_utf8_lossy` over
+    // arbitrary bytes, so every input below is reachable from a malformed file.
+    // The contract under test is totality: a wrong answer is acceptable on
+    // garbage, a panic is not.
+
+    #[test]
+    fn slice_between_extracts_delimited_content() {
+        assert_eq!(
+            slice_between("/MediaBox [0 0 612 792] /X", b'[', b']'),
+            Some("0 0 612 792")
+        );
+        assert_eq!(slice_between("[]", b'[', b']'), Some(""));
+    }
+
+    #[test]
+    fn slice_between_searches_the_closer_after_the_opener() {
+        // A closer that only appears BEFORE the opener must not produce an
+        // inverted range. Mutated `/MediaBox ][` reached `&area[start+1..end]`
+        // with start > end and panicked ("byte range starts at 26 but ends at
+        // 22"); the closer is now searched in the remainder after the opener.
+        assert_eq!(slice_between("/MediaBox ][", b'[', b']'), None);
+        assert_eq!(slice_between("] a [ b ] c", b'[', b']'), Some(" b "));
+    }
+
+    #[test]
+    fn slice_between_returns_none_when_a_delimiter_is_missing() {
+        assert_eq!(slice_between("/MediaBox 0 0 612 792", b'[', b']'), None);
+        assert_eq!(slice_between("/MediaBox [0 0 612 792", b'[', b']'), None);
+        assert_eq!(slice_between("", b'[', b']'), None);
+    }
+
+    #[test]
+    fn slice_between_never_splits_a_multibyte_char() {
+        // U+FFFD is what from_utf8_lossy leaves behind for every invalid byte,
+        // so multi-byte content is the norm here, not an edge case.
+        assert_eq!(
+            slice_between("[\u{FFFD}\u{20AC}]", b'[', b']'),
+            Some("\u{FFFD}\u{20AC}")
+        );
+        // Delimiters are ASCII: they can never match a continuation byte of a
+        // multi-byte sequence, so the bounds always land on char boundaries.
+        assert_eq!(slice_between("\u{20AC}[x]\u{20AC}", b'[', b']'), Some("x"));
+    }
+
+    #[test]
+    fn find_dict_end_locates_the_closing_marker() {
+        // Offset is relative to the text after the opening `<<`, and points at
+        // the `>` of the matching `>>`.
+        assert_eq!(find_dict_end(" /A 1 >>"), Some(6));
+        assert_eq!(find_dict_end(">>"), Some(0));
+    }
+
+    #[test]
+    fn find_dict_end_matches_nesting() {
+        assert_eq!(find_dict_end(" /A << /B 1 >> >> tail"), Some(15));
+    }
+
+    #[test]
+    fn find_dict_end_returns_none_when_unbalanced() {
+        assert_eq!(find_dict_end(" /A 1"), None);
+        assert_eq!(find_dict_end(" /A << /B 1 >>"), None);
+        assert_eq!(find_dict_end(""), None);
+        assert_eq!(find_dict_end(">"), None);
+    }
+
+    #[test]
+    fn find_dict_end_offset_is_a_char_boundary_with_multibyte_content() {
+        // The scan is byte-level; `<`/`>` are ASCII and cannot occur inside a
+        // multi-byte sequence, so the returned offset is always sliceable.
+        let after = " /Font \u{FFFD} >> tail";
+        let end = find_dict_end(after).expect("closes");
+        assert_eq!(&after[..end], " /Font \u{FFFD} ");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_cuts_without_splitting() {
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_on_char_boundary("abcdef", 3), "abc");
+        // Cutting at 1 would land inside the 3-byte U+FFFD: back off to 0.
+        assert_eq!(truncate_on_char_boundary("\u{FFFD}x", 1), "");
+        assert_eq!(truncate_on_char_boundary("\u{FFFD}x", 3), "\u{FFFD}");
+        assert_eq!(truncate_on_char_boundary("", 5), "");
     }
 
     /// Reader instrumented with two shared counters so a test can reset them after

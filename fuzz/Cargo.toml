@@ -1,0 +1,45 @@
+# Fuzzing harness for the oxidize-pdf parser and text-extraction pipeline.
+#
+# This crate is EXCLUDED from the main workspace (see the root Cargo.toml
+# `[workspace].exclude`) exactly like `lints/`, because cargo-fuzz / libFuzzer
+# require a nightly toolchain. Keeping it out of the workspace means the MSRV /
+# stable CI gates are never affected by this crate.
+#
+# Run:  cargo +nightly fuzz run parse_document
+# See README.md for the full workflow and the stable regression bridge.
+[package]
+name = "oxidize-pdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxidize-pdf]
+path = "../oxidize-pdf-core"
+
+# Prevent this from interfering with workspace resolution.
+[workspace]
+
+[[bin]]
+name = "parse_document"
+path = "fuzz_targets/parse_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_text"
+path = "fuzz_targets/extract_text.rs"
+test = false
+doc = false
+bench = false
+
+# libFuzzer needs some debug info to symbolize crashes, and an unwinding panic
+# strategy so libfuzzer-sys can catch a Rust panic as a crash artifact.
+[profile.release]
+debug = 1
