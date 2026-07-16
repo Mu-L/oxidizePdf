@@ -10,10 +10,49 @@ use oxidize_pdf::{Document, Font, Page};
 use proptest::prelude::*;
 use std::io::Cursor;
 
+const ROBOTO_PATH: &str = "../test-pdfs/Roboto-Regular.ttf";
+const SOURCE_SANS_PATH: &str = "../test-pdfs/SourceSans3-Regular.otf";
+
+fn roboto() -> Vec<u8> {
+    std::fs::read(ROBOTO_PATH).expect("read Roboto fixture")
+}
+
+fn source_sans() -> Vec<u8> {
+    std::fs::read(SOURCE_SANS_PATH).expect("read SourceSans fixture")
+}
+
 /// Serialize `doc` and re-parse it back into a navigable document.
 fn reparse(bytes: Vec<u8>) -> PdfDocument<Cursor<Vec<u8>>> {
     let reader = PdfReader::new(Cursor::new(bytes)).expect("re-parse written PDF");
     PdfDocument::new(reader)
+}
+
+/// Walk the page's /Font resource dict and return each resolved font's BaseFont
+/// (empty string if a font dict has no BaseFont). Mirrors the walk in
+/// issue_395_font_collision_test.rs.
+fn page_base_fonts(page_index: u32, doc: &PdfDocument<Cursor<Vec<u8>>>) -> Vec<String> {
+    let page = doc.get_page(page_index).expect("get_page");
+    let resources = match page.get_resources() {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let font_dict = match resources.get("Font").and_then(|f| f.as_dict()) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (_name, obj) in font_dict.0.iter() {
+        let resolved = doc.resolve(obj).expect("resolve font");
+        if let Some(fd) = resolved.as_dict() {
+            let base = fd
+                .get("BaseFont")
+                .and_then(|b| b.as_name())
+                .map(|n| n.0.clone())
+                .unwrap_or_default();
+            out.push(base);
+        }
+    }
+    out
 }
 
 /// Append one A4 page carrying a single text marker at a fixed position.
@@ -95,6 +134,71 @@ proptest! {
     }
 }
 
+proptest! {
+    // Reduced case count: each case embeds and subsets a TTF (and sometimes an
+    // OTF), which is costly. 64 is a coverage/cost tradeoff, not a coverage
+    // ceiling on the invariant.
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Embedded fonts survive the round-trip, distinct and uncollapsed (#395).
+    ///
+    /// Note: the writer always emits the full standard-14 set into every page's
+    /// /Font dict regardless of use, so a *count* over all fonts is meaningless
+    /// here. #395 was a collision of preserved *embedded* fonts, so the guard
+    /// embeds one or two distinct custom fonts and asserts each survives by name
+    /// — a collision would drop or merge one of them.
+    #[test]
+    fn embedded_fonts_preserved(
+        use_second in any::<bool>(),
+        std_marker in marker(),
+    ) {
+        let mut doc = Document::new();
+        doc.add_font_from_bytes("Roboto", roboto()).expect("embed Roboto");
+        if use_second {
+            doc.add_font_from_bytes("SourceSans", source_sans())
+                .expect("embed SourceSans");
+        }
+        let mut page = Page::a4();
+        page.text()
+            .set_font(Font::Custom("Roboto".to_string()), 12.0)
+            .at(72.0, 760.0)
+            .write("Robo")
+            .expect("write");
+        if use_second {
+            page.text()
+                .set_font(Font::Custom("SourceSans".to_string()), 12.0)
+                .at(72.0, 720.0)
+                .write("Sans")
+                .expect("write");
+        }
+        // A standard-14 line too, to mix embedded and builtin on one page.
+        page.text()
+            .set_font(Font::Helvetica, 12.0)
+            .at(72.0, 680.0)
+            .write(&std_marker)
+            .expect("write");
+        doc.add_page(page);
+
+        let document = reparse(doc.to_bytes().expect("serialize"));
+        let bases = page_base_fonts(0, &document);
+        prop_assert!(
+            bases.iter().any(|b| b.contains("Roboto")),
+            "embedded Roboto lost: {bases:?}"
+        );
+        if use_second {
+            prop_assert!(
+                bases.iter().any(|b| b.contains("SourceSans")),
+                "second embedded font collapsed or lost: {bases:?}"
+            );
+        }
+        // Helvetica (builtin) is always present too.
+        prop_assert!(
+            bases.iter().any(|b| b == "Helvetica"),
+            "Helvetica missing: {bases:?}"
+        );
+    }
+}
+
 /// #364 pin: a written marker must read back non-empty and present.
 #[test]
 fn issue_364_written_text_reads_back() {
@@ -109,5 +213,38 @@ fn issue_364_written_text_reads_back() {
     assert!(
         text.contains("MARKER364"),
         "#364: marker lost; got {text:?}"
+    );
+}
+
+/// #395 pin: two distinct embedded fonts on one page must both survive the
+/// round-trip without collapsing into one.
+#[test]
+fn issue_395_two_distinct_embedded_fonts_no_collision() {
+    let mut doc = Document::new();
+    doc.add_font_from_bytes("Roboto", roboto())
+        .expect("embed Roboto");
+    doc.add_font_from_bytes("SourceSans", source_sans())
+        .expect("embed SourceSans");
+    let mut page = Page::a4();
+    page.text()
+        .set_font(Font::Custom("Roboto".to_string()), 12.0)
+        .at(72.0, 760.0)
+        .write("Robo")
+        .expect("write");
+    page.text()
+        .set_font(Font::Custom("SourceSans".to_string()), 12.0)
+        .at(72.0, 720.0)
+        .write("Sans")
+        .expect("write");
+    doc.add_page(page);
+    let document = reparse(doc.to_bytes().expect("serialize"));
+    let bases = page_base_fonts(0, &document);
+    assert!(
+        bases.iter().any(|b| b.contains("Roboto")),
+        "#395: Roboto lost: {bases:?}"
+    );
+    assert!(
+        bases.iter().any(|b| b.contains("SourceSans")),
+        "#395: SourceSans collapsed or lost: {bases:?}"
     );
 }
