@@ -458,7 +458,11 @@ impl EncryptionHandler {
             }
         }
 
-        // Step 4: Decrypt O entry to get user password
+        // Step 4: Decrypt O entry to get user password. `/O` is a 32-byte string
+        // by spec; a short one from a malformed file would panic the slice below.
+        if self.encryption_info.o.len() < 32 {
+            return Ok(false);
+        }
         let mut decrypted = self.encryption_info.o[..32].to_vec();
 
         if self.encryption_info.r >= 3 {
@@ -479,27 +483,59 @@ impl EncryptionHandler {
             decrypted = cipher.process(&decrypted);
         }
 
-        // Step 5: The decrypted data is the padded user password
-        // Find where padding starts to extract the actual password
-        let user_pwd_end = decrypted
-            .iter()
-            .position(|&b| {
-                // Check if this byte is the start of the padding sequence
-                b == PADDING[0] && decrypted.len() > 1
-            })
-            .unwrap_or(32);
+        // Step 5: `decrypted` IS the padded user password (Algorithm 3, step e).
+        // Authenticate it exactly as the user path does, straight from these 32
+        // bytes — never reconstruct a `&str` and re-pad it. The old code searched
+        // for where the standard padding began (byte 0x28, '(') and truncated
+        // there; with a wrong owner password the bytes are garbage, and whenever
+        // the first byte was 0x28 the "password" collapsed to "", which re-pads
+        // to the exact standard padding and then authenticates ANY document with
+        // an empty user password. That granted owner access on ~1/256 of wrong
+        // attempts (owner-unlock fail-open). Running the raw bytes through the
+        // standard verifier removes the truncation and the bypass.
+        let permissions = Permissions::from_bits(self.encryption_info.p as u32);
+        let encrypt_metadata = self.encryption_info.encrypt_metadata || self.encryption_info.r < 4;
 
-        let user_password = String::from_utf8_lossy(&decrypted[..user_pwd_end]).to_string();
+        let computed_u = self
+            .security_handler
+            .compute_user_hash_from_padded(
+                &decrypted,
+                &self.encryption_info.o,
+                permissions,
+                self.file_id.as_deref(),
+                encrypt_metadata,
+            )
+            .map_err(|e| ParseError::SyntaxError {
+                position: 0,
+                message: format!("Failed to compute user hash from /O: {e}"),
+            })?;
 
-        // Step 6: Try to unlock with the derived user password
-        if self.unlock_with_user_password(&user_password)? {
-            return Ok(true);
+        // R3+ compares the first 16 bytes of /U; R2 compares all 32.
+        let comparison_length = if self.encryption_info.r >= 3 { 16 } else { 32 };
+        if computed_u.len() < comparison_length || self.encryption_info.u.len() < comparison_length
+        {
+            return Ok(false);
+        }
+        if computed_u[..comparison_length] != self.encryption_info.u[..comparison_length] {
+            return Ok(false);
         }
 
-        // If the derived password didn't work, try with the full padded password
-        // (some PDFs may use the raw padded form)
-        let full_user_password = String::from_utf8_lossy(&decrypted).to_string();
-        self.unlock_with_user_password(&full_user_password)
+        // Owner authenticated: derive and retain the file key from the same bytes.
+        let key = self
+            .security_handler
+            .compute_key_from_padded(
+                &decrypted,
+                &self.encryption_info.o,
+                permissions,
+                self.file_id.as_deref(),
+                encrypt_metadata,
+            )
+            .map_err(|e| ParseError::SyntaxError {
+                position: 0,
+                message: format!("Failed to compute key from /O: {e}"),
+            })?;
+        self.encryption_key = Some(key);
+        Ok(true)
     }
 
     /// Try to unlock with empty password (common case)

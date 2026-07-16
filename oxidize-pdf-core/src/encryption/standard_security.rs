@@ -221,9 +221,49 @@ impl StandardSecurityHandler {
         file_id: Option<&[u8]>,
         encrypt_metadata: bool,
     ) -> Result<Vec<u8>> {
-        // Compute encryption key
-        let key = self.compute_encryption_key_with_metadata(
-            user_password,
+        // R5/R6 use an AES hash keyed on the cleartext password; there is no
+        // 32-byte padding step, so they stay on the string API. R2-R4 pad and
+        // route through the shared padded-password core.
+        if matches!(
+            self.revision,
+            SecurityHandlerRevision::R5 | SecurityHandlerRevision::R6
+        ) {
+            let aes_key =
+                self.compute_aes_encryption_key(user_password, owner_hash, permissions, file_id)?;
+            return Ok(sha256(&aes_key.key));
+        }
+
+        let padded = Self::pad_password(&user_password.0);
+        self.compute_user_hash_from_padded(
+            &padded,
+            owner_hash,
+            permissions,
+            file_id,
+            encrypt_metadata,
+        )
+    }
+
+    /// `/U` verifier (ISO 32000-1 §7.6.3.4, Algorithm 4/5) for the RC4/MD5
+    /// revisions (R2-R4), computed from an already-padded 32-byte password rather
+    /// than a `&str` this pads itself.
+    ///
+    /// The owner-unlock path (Algorithm 3) recovers the user password by
+    /// decrypting `/O`, which yields the **padded** 32 bytes directly — there is
+    /// no cleartext string to reconstruct. Feeding those bytes back through the
+    /// string API would re-pad them and, worse, let a wrong password's garbage
+    /// collapse to a shorter string that re-pads to a matching verifier. This
+    /// entry point consumes the 32 bytes verbatim, closing that fail-open.
+    pub(crate) fn compute_user_hash_from_padded(
+        &self,
+        padded: &[u8],
+        owner_hash: &[u8],
+        permissions: Permissions,
+        file_id: Option<&[u8]>,
+        encrypt_metadata: bool,
+    ) -> Result<Vec<u8>> {
+        // Compute encryption key from the padded password
+        let key = self.compute_key_from_padded(
+            padded,
             owner_hash,
             permissions,
             file_id,
@@ -266,17 +306,11 @@ impl StandardSecurityHandler {
                 Ok(result)
             }
             SecurityHandlerRevision::R5 | SecurityHandlerRevision::R6 => {
-                // For R5/R6, use AES-based hash computation
-                let aes_key = self.compute_aes_encryption_key(
-                    user_password,
-                    owner_hash,
-                    permissions,
-                    file_id,
-                )?;
-                let hash = sha256(&aes_key.key);
-
-                // For AES revisions, return the hash directly (simplified)
-                Ok(hash)
+                // R5/R6 never reach here — the padded-password concept is RC4-only,
+                // and `compute_user_hash_with_metadata` handles them before padding.
+                Err(crate::error::PdfError::EncryptionError(
+                    "padded-password user hash is not defined for R5/R6".to_string(),
+                ))
             }
         }
     }
@@ -321,44 +355,64 @@ impl StandardSecurityHandler {
                 self.compute_aes_encryption_key(user_password, owner_hash, permissions, file_id)
             }
             _ => {
-                // For RC4 revisions, use MD5-based key computation
-                // Step 1: Pad password
                 let padded = Self::pad_password(&user_password.0);
-
-                // Step 2: Create hash input
-                let mut data = Vec::new();
-                data.extend_from_slice(&padded);
-                data.extend_from_slice(owner_hash);
-                data.extend_from_slice(&permissions.bits().to_le_bytes());
-
-                if let Some(id) = file_id {
-                    data.extend_from_slice(id);
-                }
-
-                // ISO 32000-1 Algorithm 2, step (f): when metadata is not
-                // encrypted, append 0xFFFFFFFF before hashing. The revision gate
-                // (R >= 4) is applied by the caller: `self.revision` here is a
-                // cipher proxy (R4-with-RC4 reports R3), so it cannot gate this.
-                if !encrypt_metadata {
-                    data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-                }
-
-                // Step 3: Create MD5 hash
-                let mut hash = md5::compute(&data).to_vec();
-
-                // Step 4: For revision 3+, do 50 additional iterations
-                if self.revision >= SecurityHandlerRevision::R3 {
-                    for _ in 0..50 {
-                        hash = md5::compute(&hash[..self.key_length]).to_vec();
-                    }
-                }
-
-                // Step 5: Truncate to key length
-                hash.truncate(self.key_length);
-
-                Ok(EncryptionKey::new(hash))
+                self.compute_key_from_padded(
+                    &padded,
+                    owner_hash,
+                    permissions,
+                    file_id,
+                    encrypt_metadata,
+                )
             }
         }
+    }
+
+    /// File key (ISO 32000-1 §7.6.3.3, Algorithm 2) for the RC4/MD5 revisions
+    /// (R2-R4), computed from an already-padded 32-byte password. See
+    /// [`compute_user_hash_from_padded`](Self::compute_user_hash_from_padded) for
+    /// why the owner path must not go through the self-padding string API.
+    pub(crate) fn compute_key_from_padded(
+        &self,
+        padded: &[u8],
+        owner_hash: &[u8],
+        permissions: Permissions,
+        file_id: Option<&[u8]>,
+        encrypt_metadata: bool,
+    ) -> Result<EncryptionKey> {
+        debug_assert!(self.revision <= SecurityHandlerRevision::R4);
+
+        // Step 2: Create hash input
+        let mut data = Vec::new();
+        data.extend_from_slice(padded);
+        data.extend_from_slice(owner_hash);
+        data.extend_from_slice(&permissions.bits().to_le_bytes());
+
+        if let Some(id) = file_id {
+            data.extend_from_slice(id);
+        }
+
+        // ISO 32000-1 Algorithm 2, step (f): when metadata is not encrypted,
+        // append 0xFFFFFFFF before hashing. The revision gate (R >= 4) is applied
+        // by the caller: `self.revision` here is a cipher proxy (R4-with-RC4
+        // reports R3), so it cannot gate this.
+        if !encrypt_metadata {
+            data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+
+        // Step 3: Create MD5 hash
+        let mut hash = md5::compute(&data).to_vec();
+
+        // Step 4: For revision 3+, do 50 additional iterations
+        if self.revision >= SecurityHandlerRevision::R3 {
+            for _ in 0..50 {
+                hash = md5::compute(&hash[..self.key_length]).to_vec();
+            }
+        }
+
+        // Step 5: Truncate to key length
+        hash.truncate(self.key_length);
+
+        Ok(EncryptionKey::new(hash))
     }
 
     /// Encrypt a string

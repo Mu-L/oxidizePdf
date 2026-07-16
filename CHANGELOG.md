@@ -8,8 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## [Unreleased]
 
+### Security
+
+- **Owner-password unlock fail-open and its fail-safe twin (#430).** The RC4/MD5
+  owner-unlock path (R2-R4) decrypted `/O` to the 32-byte padded user password,
+  then reconstructed a string by truncating at the first standard-padding byte
+  (`0x28`, `(`). Two faults, one root cause: (a) a **fail-open** — with a wrong
+  owner password the 32 bytes are garbage, and whenever the first byte was
+  `0x28` the derived password collapsed to `""`, which re-padded to the standard
+  padding and authenticated any document with an empty user password, granting
+  owner access on ~1/256 of wrong attempts; (b) **#430**, a fail-safe twin —
+  a legitimate user password of `(` also truncated to `""`, so the correct owner
+  password no longer unlocked. The path now runs the decrypted bytes through the
+  standard `/U` verifier (ISO 32000-1 §7.6.3.4, Algorithm 3) with no truncation,
+  closing both. Also hardened owner unlock against a short `/O` (was a reachable
+  panic). Found by the encryption round-trip invariant, not a field report.
+
 ### Fixed
 
+- **Two parser panics on malformed page dictionaries.** The manual recovery
+  path, which rebuilds page objects from raw text when the xref is unusable,
+  sliced strings with unvalidated indices in three places. A page dictionary
+  whose `/MediaBox` closer preceded its opener (`/MediaBox ][`) produced an
+  inverted range ("byte range starts at 26 but ends at 22"); a `/Resources`
+  dictionary containing any non-UTF-8 byte scanned a `Vec<char>` with
+  byte-derived indices and split the resulting U+FFFD ("not a char boundary");
+  a third site truncated a debug string mid-char. All three now go through
+  total helpers that cannot panic on any input, and the two duplicated
+  nested-dictionary scanners are unified into one. Reachable in **every**
+  strictness mode, including `strict`. Found pre-report by the new
+  parser-never-panics invariant, not by a user; both inputs are pinned as fuzz
+  regression fixtures.
 - **Parser panic on malformed input** (#427). `find_catalog_by_content`'s
   extreme-last-resort catalog scan sliced a `from_utf8_lossy` string at a byte
   index that could fall inside a multibyte replacement char (U+FFFD), panicking
