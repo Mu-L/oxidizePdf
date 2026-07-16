@@ -25,3 +25,14 @@ cargo test -p oxidize-pdf fuzz_regression_corpus_does_not_crash
 
 Files here need **not** be valid PDFs — they are whatever bytes triggered the
 crash. Keep them small (minimized) so the stable gate stays fast.
+
+The first byte of each fixture is the fuzz target's mode selector (`% 4` picks
+strict / tolerant / lenient / skip-errors); the rest is the input document.
+
+## Promoting a proptest failure
+
+`tests/prop_parser_panic_invariants.rs` hunts the same class on stable, and its
+shrunk counterexamples belong here too — `.proptest-regressions` files are
+gitignored on purpose (the durable pin is the fixture, not the RNG seed, which
+does not survive a proptest upgrade). Rebuild the shrunk input, prepend a
+selector byte, and drop it in.

@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two parser panics on malformed page dictionaries.** The manual recovery
+  path, which rebuilds page objects from raw text when the xref is unusable,
+  sliced strings with unvalidated indices in three places. A page dictionary
+  whose `/MediaBox` closer preceded its opener (`/MediaBox ][`) produced an
+  inverted range ("byte range starts at 26 but ends at 22"); a `/Resources`
+  dictionary containing any non-UTF-8 byte scanned a `Vec<char>` with
+  byte-derived indices and split the resulting U+FFFD ("not a char boundary");
+  a third site truncated a debug string mid-char. All three now go through
+  total helpers that cannot panic on any input, and the two duplicated
+  nested-dictionary scanners are unified into one. Reachable in **every**
+  strictness mode, including `strict`. Found pre-report by the new
+  parser-never-panics invariant, not by a user; both inputs are pinned as fuzz
+  regression fixtures.
 - **Parser panic on malformed input** (#427). `find_catalog_by_content`'s
   extreme-last-resort catalog scan sliced a `from_utf8_lossy` string at a byte
   index that could fall inside a multibyte replacement char (U+FFFD), panicking
