@@ -1,0 +1,180 @@
+//! Chunking-layer invariants, stated from the RAG contract (`the chunk set is a
+//! faithful partition of the input text, and every chunk is fit to be
+//! vectorized`), not from a reported bug. `HybridChunker::chunk` is a pure
+//! function of (elements, config), so the generator is cheap and the input space
+//! is large: element types × lengths × headings × five config dimensions × two
+//! token counters.
+//!
+//! Layer rule (see spec §4): an invariant lives at the cheapest layer where it
+//! is NOT tautological. `chunk_index` and `heading_path` are supplied by the
+//! caller at this layer, so asserting them here would test the test. They live
+//! in `prop_rag_e2e_invariants.rs`.
+//!
+//! Known gap, accepted: `HybridChunker::chunk_with_graph` is a second public
+//! grouping path with its own section logic and is NOT covered here (it needs an
+//! `ElementGraph`). Example guards live in `hybrid_chunking_graph_test.rs`.
+
+use oxidize_pdf::pipeline::{
+    ContextFormat, ContextMode, Element, ElementData, ElementMetadata, HybridChunk,
+    HybridChunkConfig, HybridChunker, KeyValueElementData, MergePolicy, TableElementData,
+};
+use proptest::prelude::*;
+use std::collections::BTreeMap;
+
+/// A generated element, before it is given its position-derived marker.
+#[derive(Debug, Clone)]
+struct ElemSpec {
+    /// 0=Paragraph 1=ListItem 2=KeyValue (inline, mergeable);
+    /// 3=Title 4=Table 5=CodeBlock (structural, always start a new chunk).
+    kind: u8,
+    words: usize,
+    page: u32,
+    has_heading: bool,
+}
+
+fn elem_spec() -> impl Strategy<Value = ElemSpec> {
+    (0u8..6u8, 1usize..=60usize, 0u32..=3u32, any::<bool>()).prop_map(
+        |(kind, words, page, has_heading)| ElemSpec {
+            kind,
+            words,
+            page,
+            has_heading,
+        },
+    )
+}
+
+/// Build the element for `s` at input position `idx`.
+///
+/// The text opens with the unique marker `E{idx}_`. Markers are prefix-free
+/// thanks to the trailing `_` and a body that never contains `_`, so
+/// `text.contains("E1_")` cannot be satisfied by `E11_`.
+///
+/// Every fifth word ends in `.` so the text carries real sentence boundaries —
+/// without them `split_by_sentences` returns the whole text as one fragment and
+/// the oversized-split path (`hybrid_chunking.rs:337-356`) is never exercised.
+fn make_element(s: &ElemSpec, idx: usize) -> Element {
+    let body = (0..s.words)
+        .map(|w| {
+            if w % 5 == 4 {
+                format!("w{w}.")
+            } else {
+                format!("w{w}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = format!("E{idx}_ {body}");
+    let metadata = ElementMetadata {
+        page: s.page,
+        parent_heading: s.has_heading.then(|| format!("H{idx}")),
+        ..Default::default()
+    };
+    match s.kind {
+        0 => Element::Paragraph(ElementData { text, metadata }),
+        1 => Element::ListItem(ElementData { text, metadata }),
+        2 => Element::KeyValue(KeyValueElementData {
+            key: text,
+            value: String::from("v"),
+            metadata,
+        }),
+        3 => Element::Title(ElementData { text, metadata }),
+        4 => Element::Table(TableElementData::new(vec![vec![text]], metadata)),
+        _ => Element::CodeBlock(ElementData { text, metadata }),
+    }
+}
+
+fn element_seq() -> impl Strategy<Value = Vec<Element>> {
+    prop::collection::vec(elem_spec(), 1..=12).prop_map(|specs| {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| make_element(s, i))
+            .collect()
+    })
+}
+
+/// `max_tokens` in 4..=64 against elements of 1..=60 words: the budget is
+/// routinely smaller than a single element, so the flush, the type-boundary and
+/// the oversized-split paths all fire.
+fn chunk_config() -> impl Strategy<Value = HybridChunkConfig> {
+    (
+        4usize..=64usize,
+        any::<bool>(),
+        any::<bool>(),
+        prop_oneof![
+            Just(MergePolicy::SameTypeOnly),
+            Just(MergePolicy::AnyInlineContent)
+        ],
+        prop_oneof![
+            Just(ContextMode::None),
+            Just(ContextMode::Heading),
+            Just(ContextMode::Contextual(ContextFormat::Labeled)),
+            Just(ContextMode::Contextual(ContextFormat::Prose)),
+        ],
+    )
+        .prop_map(
+            |(max_tokens, merge_adjacent, propagate_headings, merge_policy, context_mode)| {
+                HybridChunkConfig {
+                    max_tokens,
+                    overlap_tokens: 0,
+                    merge_adjacent,
+                    propagate_headings,
+                    merge_policy,
+                    context_mode,
+                }
+            },
+        )
+}
+
+fn chunk(elements: &[Element], config: HybridChunkConfig) -> Vec<HybridChunk> {
+    HybridChunker::new(config).chunk(elements)
+}
+
+/// Word -> occurrence count. Whitespace-split, so it is robust to the chunker's
+/// legitimate reflow of separators but still catches a dropped or duplicated word.
+fn word_multiset(s: &str) -> BTreeMap<&str, usize> {
+    let mut m = BTreeMap::new();
+    for w in s.split_whitespace() {
+        *m.entry(w).or_insert(0) += 1;
+    }
+    m
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I2a — IDENTITY: each input element's marker lands in exactly one chunk.
+    /// When an oversized element is split, its marker rides the first fragment,
+    /// so the count stays 1 either way.
+    #[test]
+    fn every_element_marker_lands_in_exactly_one_chunk(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let chunks = chunk(&elements, config);
+        for idx in 0..elements.len() {
+            let marker = format!("E{idx}_");
+            let hits = chunks.iter().filter(|c| c.text().contains(&marker)).count();
+            prop_assert_eq!(hits, 1, "marker {} landed in {} chunks", marker, hits);
+        }
+    }
+
+    /// I2b — CONSERVATION: the chunk set carries every input word exactly as
+    /// often as the input did. Identity alone (I2a) is satisfiable by dropping
+    /// everything but the first word of each element; conservation alone does
+    /// not localize. Both are required.
+    #[test]
+    fn chunk_text_conserves_every_input_word(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let input = elements
+            .iter()
+            .map(|e| e.display_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk(&elements, config);
+        let output = chunks.iter().map(|c| c.text()).collect::<Vec<_>>().join("\n");
+        prop_assert_eq!(word_multiset(&output), word_multiset(&input));
+    }
+}
