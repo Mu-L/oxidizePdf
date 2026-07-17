@@ -16,7 +16,8 @@
 
 use oxidize_pdf::pipeline::{
     ContextFormat, ContextMode, Element, ElementData, ElementMetadata, HybridChunk,
-    HybridChunkConfig, HybridChunker, KeyValueElementData, MergePolicy, TableElementData,
+    HybridChunkConfig, HybridChunker, KeyValueElementData, MergePolicy, RagChunk, TableElementData,
+    TokenCounter, WordProxyCounter,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -176,5 +177,44 @@ proptest! {
         let chunks = chunk(&elements, config);
         let output = chunks.iter().map(|c| c.text()).collect::<Vec<_>>().join("\n");
         prop_assert_eq!(word_multiset(&output), word_multiset(&input));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I3 — HONEST BUDGET: the number stamped as a chunk's cost counts exactly
+    /// the text the library designates as embeddable.
+    ///
+    /// `RagChunk::full_text` is that designated text (`rag.rs:23`:
+    /// "use this for embedding generation") and `token_estimate` is documented
+    /// as its token count. If they disagree, a consumer sizing against a real
+    /// embedding model's hard limit is silently over budget: the provider
+    /// truncates the tail, the tail never reaches the vector, and that content
+    /// becomes unretrievable while still sitting in the store.
+    ///
+    /// PINNED: fails today — see issue #434. The property states the contract;
+    /// the code does not honor it yet. Remove `#[ignore]` when the fix ships and
+    /// this becomes a permanent guard. Precedent: #430.
+    #[test]
+    #[ignore = "issue #434: token_estimate does not measure full_text"]
+    fn stamped_count_measures_the_text_designated_for_embedding(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let mode = config.context_mode;
+        let chunks = chunk(&elements, config);
+        for (i, c) in chunks.iter().enumerate() {
+            let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
+            let measured = WordProxyCounter.count(&rag.full_text);
+            prop_assert_eq!(
+                rag.token_estimate,
+                measured,
+                "chunk {}: stamped {} tokens, full_text measures {}",
+                i,
+                rag.token_estimate,
+                measured
+            );
+        }
     }
 }
