@@ -20,7 +20,7 @@ use oxidize_pdf::pipeline::{
     TokenCounter, WordProxyCounter,
 };
 use proptest::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A generated element, before it is given its position-derived marker.
 #[derive(Debug, Clone)]
@@ -215,6 +215,55 @@ proptest! {
                 rag.token_estimate,
                 measured
             );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I4a — ORDER: chunks come out in input-element order. Consumers rebuild
+    /// context from neighbouring chunks, so a reordering silently changes what
+    /// an LLM is handed as "the surrounding text".
+    ///
+    /// Fragments of a split element carry no marker (only the first fragment
+    /// does), so they are skipped here; they are contiguous with their marked
+    /// head by construction.
+    #[test]
+    fn chunks_come_out_in_input_element_order(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let n = elements.len();
+        let chunks = chunk(&elements, config);
+        let firsts: Vec<usize> = chunks
+            .iter()
+            .filter_map(|c| {
+                let t = c.text();
+                (0..n).find(|i| t.contains(&format!("E{i}_")))
+            })
+            .collect();
+        let mut sorted = firsts.clone();
+        sorted.sort_unstable();
+        prop_assert_eq!(&firsts, &sorted, "chunk order does not follow input order");
+    }
+
+    /// I4b — PAGE TRACEABILITY: a chunk's `page_numbers` is exactly the union of
+    /// its elements' pages. It is a filter field in the vector store: if it
+    /// lies, a page-scoped query returns incomplete results and never errors.
+    #[test]
+    fn chunk_pages_are_the_union_of_its_elements_pages(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let mode = config.context_mode;
+        let chunks = chunk(&elements, config);
+        for (i, c) in chunks.iter().enumerate() {
+            let expected: BTreeSet<u32> =
+                c.elements().iter().map(|e| e.metadata().page).collect();
+            let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
+            let actual: BTreeSet<u32> = rag.page_numbers.iter().copied().collect();
+            prop_assert_eq!(actual, expected, "chunk {} page set", i);
         }
     }
 }
