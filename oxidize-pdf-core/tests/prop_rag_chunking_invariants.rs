@@ -14,6 +14,8 @@
 //! grouping path with its own section logic and is NOT covered here (it needs an
 //! `ElementGraph`). Example guards live in `hybrid_chunking_graph_test.rs`.
 
+#[cfg(feature = "tiktoken")]
+use oxidize_pdf::pipeline::TiktokenCounter;
 use oxidize_pdf::pipeline::{
     ContextFormat, ContextMode, Element, ElementData, ElementMetadata, HybridChunk,
     HybridChunkConfig, HybridChunker, KeyValueElementData, MergePolicy, RagChunk, TableElementData,
@@ -21,6 +23,8 @@ use oxidize_pdf::pipeline::{
 };
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "tiktoken")]
+use std::sync::{Arc, OnceLock};
 
 /// A generated element, before it is given its position-derived marker.
 #[derive(Debug, Clone)]
@@ -264,6 +268,54 @@ proptest! {
             let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
             let actual: BTreeSet<u32> = rag.page_numbers.iter().copied().collect();
             prop_assert_eq!(actual, expected, "chunk {} page set", i);
+        }
+    }
+}
+
+/// cl100k_base ships multi-MB rank tables; load once for the whole suite rather
+/// than per generated case.
+#[cfg(feature = "tiktoken")]
+fn tiktoken() -> Arc<TiktokenCounter> {
+    static C: OnceLock<Arc<TiktokenCounter>> = OnceLock::new();
+    C.get_or_init(|| Arc::new(TiktokenCounter::cl100k_base()))
+        .clone()
+}
+
+// Fewer cases than the other blocks: every case runs real BPE over the whole
+// chunk set, which is orders of magnitude slower than the word proxy.
+#[cfg(feature = "tiktoken")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// I3-BPE — BUDGET UNDER THE INJECTED COUNTER: no chunk the chunker did not
+    /// itself flag oversized may exceed `max_tokens` when measured with the very
+    /// counter that governed the split.
+    ///
+    /// The split decision sums per-element counts while the stamp counts the
+    /// joined text (`hybrid_chunking.rs:296,308` vs `:271-277`). That identity
+    /// holds for whitespace counting and not for BPE.
+    #[test]
+    fn no_chunk_exceeds_its_budget_under_bpe(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let counter = tiktoken();
+        let max_tokens = config.max_tokens;
+        let chunks = HybridChunker::new(config)
+            .with_token_counter(counter.clone())
+            .chunk(&elements);
+        for (i, c) in chunks.iter().enumerate() {
+            if c.is_oversized() {
+                continue;
+            }
+            let measured = counter.count(&c.text());
+            prop_assert!(
+                measured <= max_tokens,
+                "chunk {}: {} BPE tokens over a {}-token budget",
+                i,
+                measured,
+                max_tokens
+            );
         }
     }
 }
