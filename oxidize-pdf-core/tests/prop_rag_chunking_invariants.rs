@@ -6,9 +6,12 @@
 //! token counters.
 //!
 //! Layer rule (see spec §4): an invariant lives at the cheapest layer where it
-//! is NOT tautological. `chunk_index` and `heading_path` are supplied by the
-//! caller at this layer, so asserting them here would test the test. They live
-//! in `prop_rag_e2e_invariants.rs`.
+//! is NOT tautological. `heading_path` is supplied by the caller at this layer,
+//! so asserting it here would test the test; it is guarded end-to-end by the
+//! breadcrumb property in `prop_rag_e2e_invariants.rs`. `chunk_index` is not
+//! separately guarded: production assigns it by `enumerate()`, so a
+//! contiguity assertion at any layer is structurally trivial (there is no input
+//! that makes it non-sequential) — not worth a property.
 //!
 //! Known gap, accepted: `HybridChunker::chunk_with_graph` is a second public
 //! grouping path with its own section logic and is NOT covered here (it needs an
@@ -256,11 +259,13 @@ proptest! {
     /// its elements' pages. It is a filter field in the vector store: if it
     /// lies, a page-scoped query returns incomplete results and never errors.
     ///
-    /// Scope: this guards the union/dedup/sort of pages the chunk carries, not
-    /// whether each element's page was assigned correctly — the chunker does not
-    /// assign pages, partition does. A mis-assigned page is I1's territory (E2E),
-    /// not observable here where both sides read `metadata().page` from the same
-    /// elements.
+    /// Scope: because both sides are compared as `BTreeSet`s, this guards
+    /// membership — no page dropped, none foreign — but not the dedup/ordering
+    /// of the production `Vec` (the set re-sorts and re-dedups both sides). Nor
+    /// does it guard whether each element's page was assigned correctly: the
+    /// chunker does not assign pages, partition does, so a mis-assigned page is
+    /// I1's territory (E2E), not observable here where both sides read
+    /// `metadata().page` from the same elements.
     #[test]
     fn chunk_pages_are_the_union_of_its_elements_pages(
         elements in element_seq(),
