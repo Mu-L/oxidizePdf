@@ -255,6 +255,12 @@ proptest! {
     /// I4b — PAGE TRACEABILITY: a chunk's `page_numbers` is exactly the union of
     /// its elements' pages. It is a filter field in the vector store: if it
     /// lies, a page-scoped query returns incomplete results and never errors.
+    ///
+    /// Scope: this guards the union/dedup/sort of pages the chunk carries, not
+    /// whether each element's page was assigned correctly — the chunker does not
+    /// assign pages, partition does. A mis-assigned page is I1's territory (E2E),
+    /// not observable here where both sides read `metadata().page` from the same
+    /// elements.
     #[test]
     fn chunk_pages_are_the_union_of_its_elements_pages(
         elements in element_seq(),
