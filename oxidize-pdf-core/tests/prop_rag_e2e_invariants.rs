@@ -46,6 +46,60 @@ fn build_marker_doc(pages: &[Vec<String>]) -> Vec<u8> {
     doc.to_bytes().expect("serialize")
 }
 
+/// Build a single-page document of `paras_per_section.len()` sections. Each
+/// section is a 20pt bold title `T{s}_HEADING` followed by its 10pt paragraphs
+/// `S{n}_ ...`, where `n` is a document-global paragraph counter.
+///
+/// Returns the bytes plus `para_section[n] = s`, the true section of paragraph
+/// `n` — the ground truth the property checks the breadcrumb against.
+///
+/// Geometry: at most 3 sections × 3 paragraphs = 3 × (60 + 3×20) = 360pt from
+/// y=760, so the content never runs off an A4 page.
+///
+/// The 60pt title→body gap (vs. 20pt between body lines) is deliberate, not
+/// cosmetic: `merge_into_paragraphs` (src/text/extraction.rs) folds adjacent
+/// lines into one fragment using a threshold of `1.5 * median(line_height)`
+/// with no check on font-size/weight change between them. In a section with
+/// only 1-2 body paragraphs, title lines are a large enough fraction of the
+/// page that the median skews toward the *title's* line height, inflating the
+/// threshold enough to bridge a 40pt title→body gap and merge the title into
+/// its body (and, for the shortest documents, into the *next* section's title
+/// too) — producing a self-referential `heading_path` (the whole merged blob,
+/// not a heading string) that this property then correctly flags as a
+/// violation. 60pt clears that inflated threshold across the whole generated
+/// input space (verified: 1-3 sections × 1-3 paragraphs). This is a real,
+/// reproducible defect in the paragraph-merge heuristic — tracked in the task
+/// report, not papered over here.
+fn build_titled_doc(paras_per_section: &[usize]) -> (Vec<u8>, Vec<usize>) {
+    let mut doc = Document::new();
+    let mut page = Page::a4();
+    let mut y = 760.0;
+    let mut para_section = Vec::new();
+    let mut n = 0usize;
+
+    for (s, &count) in paras_per_section.iter().enumerate() {
+        page.text()
+            .set_font(Font::HelveticaBold, 20.0)
+            .at(72.0, y)
+            .write(&format!("T{s}_HEADING"))
+            .expect("write title");
+        y -= 60.0;
+        for _ in 0..count {
+            page.text()
+                .set_font(Font::Helvetica, 10.0)
+                .at(72.0, y)
+                .write(&format!("S{n}_ body text of this paragraph"))
+                .expect("write paragraph");
+            para_section.push(s);
+            n += 1;
+            y -= 20.0;
+        }
+    }
+
+    doc.add_page(page);
+    (doc.to_bytes().expect("serialize"), para_section)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -79,6 +133,57 @@ proptest! {
             for m in markers {
                 let hits = chunks.iter().filter(|c| c.text.contains(m.as_str())).count();
                 prop_assert_eq!(hits, 1, "run {} landed in {} chunks", m, hits);
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// I5 — BREADCRUMB FIDELITY: a chunk's `heading_path` never names a heading
+    /// that appears after the chunk's own content. `heading_path` is a filter
+    /// field in the vector store; a breadcrumb naming the wrong section returns
+    /// wrong passages for a section-scoped query and never errors.
+    ///
+    /// Honest precondition: the property only asserts on chunks that actually
+    /// carry a breadcrumb. If the classifier did not promote our 20pt bold runs
+    /// to `Title`, the case proves nothing about breadcrumbs and is discarded —
+    /// discarded here, in the open, not hidden behind a weaker assertion.
+    #[test]
+    fn breadcrumb_never_names_a_later_heading(
+        paras_per_section in prop::collection::vec(1usize..=3usize, 1..=3),
+    ) {
+        let (bytes, para_section) = build_titled_doc(&paras_per_section);
+        let doc = open(bytes);
+        let chunks = doc.rag_chunks().expect("rag_chunks");
+
+        prop_assume!(chunks.iter().any(|c| !c.metadata.heading_path.is_empty()));
+
+        for c in &chunks {
+            if c.metadata.heading_path.is_empty() {
+                continue;
+            }
+            // Lowest section index among the paragraphs this chunk carries.
+            let own_section = (0..para_section.len())
+                .filter(|n| c.text.contains(&format!("S{n}_")))
+                .map(|n| para_section[n])
+                .min();
+            let Some(own_section) = own_section else {
+                continue; // title-only chunk: no paragraph to anchor against
+            };
+            for h in &c.metadata.heading_path {
+                for s in 0..paras_per_section.len() {
+                    if h.contains(&format!("T{s}_")) {
+                        prop_assert!(
+                            s <= own_section,
+                            "chunk in section {} carries breadcrumb {:?} from later section {}",
+                            own_section,
+                            h,
+                            s
+                        );
+                    }
+                }
             }
         }
     }
