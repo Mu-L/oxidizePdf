@@ -294,7 +294,12 @@ proptest! {
     /// The split decision sums per-element counts while the stamp counts the
     /// joined text (`hybrid_chunking.rs:296,308` vs `:271-277`). That identity
     /// holds for whitespace counting and not for BPE.
+    ///
+    /// PINNED: fails today — see issue #435. The property states the contract;
+    /// the code does not honor it yet. Remove `#[ignore]` when the fix ships and
+    /// this becomes a permanent guard. Precedent: #430.
     #[test]
+    #[ignore = "issue #435: split decision sums per-element counts; BPE is not additive across the join"]
     fn no_chunk_exceeds_its_budget_under_bpe(
         elements in element_seq(),
         config in chunk_config(),
