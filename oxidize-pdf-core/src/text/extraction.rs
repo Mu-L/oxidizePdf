@@ -405,6 +405,37 @@ pub fn parse_font_style(font_name: &str) -> (bool, bool) {
     (is_bold, is_italic)
 }
 
+/// Relative font-size difference below which two lines still count as the same
+/// typographic style. Absorbs the sub-point jitter a scaled text matrix
+/// produces (11.96 vs 12.0) without absorbing a real size step: the smallest
+/// step in common use is 12 → 13pt (8%).
+const PARAGRAPH_STYLE_SIZE_TOLERANCE: f64 = 0.05;
+
+/// Whether two consecutive lines share the typographic style that makes them
+/// one paragraph.
+///
+/// A paragraph is a run of lines set in the same face; a change of size or
+/// weight marks a new block. Vertical gap alone cannot tell a heading from its
+/// body — a title set 40pt above 10pt body text falls inside the same 1.5×
+/// median-line-height window as ordinary line spacing (issue #436).
+///
+/// The cost of the two errors is asymmetric, which is why this splits on a
+/// signal as weak as a weight change. An over-split leaves two adjacent
+/// fragments that downstream chunking can still group. An under-split is
+/// irreversible: the merged fragment inherits the heading's size and weight,
+/// so `partition` classifies the whole block as a `Title` and its text becomes
+/// the `heading_path` breadcrumb of everything that follows.
+fn same_paragraph_style(a: &TextFragment, b: &TextFragment) -> bool {
+    if a.is_bold != b.is_bold {
+        return false;
+    }
+    let scale = a.font_size.abs().max(b.font_size.abs());
+    if scale <= 0.0 {
+        return true; // no usable size on either line: gap decides
+    }
+    (a.font_size - b.font_size).abs() / scale <= PARAGRAPH_STYLE_SIZE_TOLERANCE
+}
+
 /// Text extractor for PDF pages with CMap support
 pub struct TextExtractor {
     options: ExtractionOptions,
@@ -643,11 +674,13 @@ impl TextExtractor {
         }
     }
 
-    /// Group consecutive lines into paragraphs based on vertical gap.
+    /// Group consecutive lines into paragraphs based on vertical gap and
+    /// typographic style.
     ///
     /// Two consecutive lines are part of the same paragraph when the vertical
-    /// gap between them is less than 1.5× the median line height in the
-    /// input. Hyphenated line breaks (previous line ends with `-` and
+    /// gap between them is less than 1.5× the median line height in the input
+    /// **and** they share the same style — see [`same_paragraph_style`].
+    /// Hyphenated line breaks (previous line ends with `-` and
     /// `merge_hyphenated` is set) join without a separator and drop the
     /// hyphen; otherwise lines join with `'\n'`.
     fn merge_into_paragraphs(&self, lines: &[TextFragment]) -> Vec<TextFragment> {
@@ -669,7 +702,11 @@ impl TextExtractor {
             let line_top = line.y + line.height;
             let gap = prev_bottom - line_top;
 
-            if gap < 0.0 || gap > max_paragraph_gap || current.mcid != line.mcid {
+            if gap < 0.0
+                || gap > max_paragraph_gap
+                || current.mcid != line.mcid
+                || !same_paragraph_style(&current, line)
+            {
                 paragraphs.push(current);
                 current = line.clone();
                 continue;
@@ -4282,6 +4319,75 @@ mod tests {
         assert_eq!(paragraphs.len(), 2);
         assert_eq!(paragraphs[0].text, "P1L1.\nP1L2.");
         assert_eq!(paragraphs[1].text, "P2L1.");
+    }
+
+    /// A heading is a different block from the body that follows it, even when
+    /// the vertical gap is small enough to look like line spacing. Merging them
+    /// destroys the two signals `partition` uses to classify a `Title`
+    /// (font-size ratio and bold-short), so the heading text is never
+    /// recoverable downstream (issue #436).
+    #[test]
+    fn merge_into_paragraphs_splits_on_font_size_change() {
+        let extractor = TextExtractor::with_options(ExtractionOptions {
+            reconstruct_paragraphs: true,
+            ..Default::default()
+        });
+        // 20pt title at y=760, 10pt body line 40pt below: gap = 30pt, which is
+        // exactly the 1.5 * median(20, 10) = 30pt vertical threshold, so only
+        // the style change can separate them.
+        let lines = vec![
+            tf("Section Heading", 72.0, 760.0, 120.0, 20.0),
+            tf("Body text of this section.", 72.0, 720.0, 150.0, 10.0),
+        ];
+        let paragraphs = extractor.merge_into_paragraphs(&lines);
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "font-size change must end the paragraph"
+        );
+        assert_eq!(paragraphs[0].text, "Section Heading");
+        assert_eq!(paragraphs[0].font_size, 20.0);
+        assert_eq!(paragraphs[1].text, "Body text of this section.");
+    }
+
+    /// Same size, different weight: the classic run-in bold heading. `partition`
+    /// classifies it through `bold_short_title`, which needs the heading to
+    /// survive extraction as its own fragment (issue #436).
+    #[test]
+    fn merge_into_paragraphs_splits_on_weight_change() {
+        let extractor = TextExtractor::with_options(ExtractionOptions {
+            reconstruct_paragraphs: true,
+            ..Default::default()
+        });
+        let mut heading = tf("Overview", 72.0, 400.0, 60.0, 12.0);
+        heading.is_bold = true;
+        let lines = vec![heading, tf("Body line.", 72.0, 386.0, 60.0, 12.0)];
+        let paragraphs = extractor.merge_into_paragraphs(&lines);
+        assert_eq!(paragraphs.len(), 2, "weight change must end the paragraph");
+        assert_eq!(paragraphs[0].text, "Overview");
+        assert!(paragraphs[0].is_bold);
+        assert_eq!(paragraphs[1].text, "Body line.");
+    }
+
+    /// Sub-point rounding (11.96pt vs 12pt from a scaled text matrix) is not a
+    /// style change: the paragraph must stay whole.
+    #[test]
+    fn merge_into_paragraphs_tolerates_subpoint_font_size_jitter() {
+        let extractor = TextExtractor::with_options(ExtractionOptions {
+            reconstruct_paragraphs: true,
+            ..Default::default()
+        });
+        let lines = vec![
+            tf("Line one.", 50.0, 400.0, 60.0, 12.0),
+            tf("Line two.", 50.0, 386.0, 60.0, 11.96),
+        ];
+        let paragraphs = extractor.merge_into_paragraphs(&lines);
+        assert_eq!(
+            paragraphs.len(),
+            1,
+            "0.3% size jitter is not a style change"
+        );
+        assert_eq!(paragraphs[0].text, "Line one.\nLine two.");
     }
 
     #[test]

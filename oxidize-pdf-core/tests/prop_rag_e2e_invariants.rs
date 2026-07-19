@@ -56,14 +56,13 @@ fn build_marker_doc(pages: &[Vec<String>]) -> Vec<u8> {
 /// Geometry: at most 3 sections × 3 paragraphs = 3 × (40 + 3×20) = 300pt from
 /// y=760, so the content never runs off an A4 page.
 ///
-/// The 40pt title→body gap (vs. 20pt between body lines) is the plan's
-/// original, realistic geometry: more space-before-heading than intra-
-/// paragraph line spacing, as in a real document. At this gap,
-/// `merge_into_paragraphs` (src/text/extraction.rs) folds the title into its
-/// body — see issue #436 — because its merge threshold
-/// (`1.5 * median(line_height)`) has no check on font-size/weight change
-/// between lines. Left at 40pt deliberately so the property keeps exercising
-/// (and failing against) that real bug instead of walking around it.
+/// The 40pt title→body gap (vs. 20pt between body lines) is realistic
+/// geometry: more space-before-heading than intra-paragraph line spacing, as
+/// in a real document. It is also the gap that exposed #436 — at 40pt the
+/// vertical threshold of `merge_into_paragraphs` (`1.5 * median(line_height)`)
+/// does not separate title from body, so only the font-size/weight check does.
+/// Kept at 40pt deliberately: widening it would walk around the bug this
+/// property exists to guard.
 fn build_titled_doc(paras_per_section: &[usize]) -> (Vec<u8>, Vec<usize>) {
     let mut doc = Document::new();
     let mut page = Page::a4();
@@ -150,13 +149,12 @@ proptest! {
     /// hard chunk boundary, so no chunk spans two sections. This property's
     /// falsifiability is instead demonstrated by the real bug #436 it catches.
     ///
-    /// PINNED: fails today — see issue #436 (text extraction merges a heading
-    /// into the following body when they are close, corrupting heading_path).
-    /// The property states the contract; extraction does not honor it yet.
-    /// Remove `#[ignore]` when #436 ships and this becomes a permanent guard.
-    /// Precedent: #430, #434, #435.
+    /// History: this property caught #436 against production code — extraction
+    /// merged a heading into the following body whenever they sat close
+    /// together, so the merged fragment inherited the heading's size and became
+    /// the breadcrumb of every section after it. Fixed by the style check in
+    /// `same_paragraph_style` (src/text/extraction.rs); now a permanent guard.
     #[test]
-    #[ignore = "issue #436: font-blind paragraph merge swallows headings into body"]
     fn breadcrumb_never_names_a_later_heading(
         paras_per_section in prop::collection::vec(1usize..=3usize, 1..=3),
     ) {
