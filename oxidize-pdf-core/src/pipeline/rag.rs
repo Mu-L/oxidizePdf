@@ -19,14 +19,21 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Field guide
 ///
-/// - `text`: raw chunk text for display or keyword search
-/// - `full_text`: heading context + text — **use this for embedding generation**
-/// - `token_estimate`: token count under the chunker's active `TokenCounter`
-///   (word-count proxy by default; a real tokenizer such as cl100k_base when a
-///   counter is injected via `rag_chunks_with_counter`). `RagChunk` does not
-///   store the counter; query the counter you injected via its `name()` for
-///   provenance.
-/// - `is_oversized`: true when a single element exceeds `max_tokens`
+/// - `text`: the chunk's content — **this is what you embed**, and what
+///   `max_tokens` and `token_estimate` both measure.
+/// - `full_text`: heading context + text, for display and for assembling a
+///   prompt at query time. **Do not embed this.** The vector represents the
+///   content, never the metadata around it: a heading repeated across every
+///   chunk of a section dilutes the signal and spends the embedding model's
+///   input budget on text that is already available, structured, as metadata to
+///   filter on.
+/// - `token_estimate`: token count of `text` under the chunker's active
+///   `TokenCounter` (word-count proxy by default; a real tokenizer such as
+///   cl100k_base when a counter is injected via `rag_chunks_with_counter`).
+///   `RagChunk` does not store the counter; query the counter you injected via
+///   its `name()` for provenance.
+/// - `is_oversized`: true when the chunk's content exceeds `max_tokens` and the
+///   chunker could not split it further without cutting mid-sentence
 ///
 /// # Example
 ///

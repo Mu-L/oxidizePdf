@@ -91,6 +91,34 @@ fn make_element(s: &ElemSpec, idx: usize) -> Element {
     }
 }
 
+/// As [`element_seq`], but some elements carry EMPTY text.
+///
+/// Only used by the BPE budget property, which is feature-gated.
+///
+/// `ElementData.text` is a plain `pub String` with no non-empty invariant, so an
+/// element with no display text is reachable through the public API. It is also
+/// the case that separates two things a budget decision must never conflate:
+/// "the buffer holds no elements" and "the buffer's accumulated text is empty".
+/// A decision keyed on the second grows the emitted chunk while measuring zero.
+///
+/// The marker-based properties cannot use this generator (they identify elements
+/// by a marker in their text), which is exactly why the budget property carries
+/// its own: the gap was invisible to a generator that always writes a marker.
+#[cfg(feature = "tiktoken")]
+fn element_seq_with_empty_texts() -> impl Strategy<Value = Vec<Element>> {
+    (element_seq(), prop::collection::vec(any::<bool>(), 12)).prop_map(|(mut els, blank)| {
+        for (i, el) in els.iter_mut().enumerate() {
+            if blank.get(i).copied().unwrap_or(false) {
+                match el {
+                    Element::Paragraph(d) | Element::ListItem(d) => d.text.clear(),
+                    _ => {}
+                }
+            }
+        }
+        els
+    })
+}
+
 fn element_seq() -> impl Strategy<Value = Vec<Element>> {
     prop::collection::vec(elem_spec(), 1..=12).prop_map(|specs| {
         specs
@@ -148,6 +176,50 @@ fn word_multiset(s: &str) -> BTreeMap<&str, usize> {
     m
 }
 
+/// Deterministic pin: a run of elements whose display text is empty must not
+/// slip past the budget check.
+///
+/// Found by review, not by the property — the generator wrote a marker into
+/// every element, so "buffer has no elements" and "buffer text is empty" never
+/// came apart. They are different questions, and a budget decision that asks the
+/// second one measures zero while the emitted chunk keeps growing: `make_chunk`
+/// joins with `"\n"`, and those separators are real tokens under BPE.
+#[cfg(feature = "tiktoken")]
+#[test]
+fn empty_text_elements_do_not_escape_the_budget() {
+    let max_tokens = 4;
+    let elements: Vec<Element> = (0..200)
+        .map(|_| {
+            Element::Paragraph(ElementData {
+                text: String::new(),
+                metadata: ElementMetadata::default(),
+            })
+        })
+        .collect();
+    let counter = tiktoken();
+    let chunks = HybridChunker::new(HybridChunkConfig {
+        max_tokens,
+        overlap_tokens: 0,
+        merge_adjacent: true,
+        propagate_headings: false,
+        merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: ContextMode::None,
+    })
+    .with_token_counter(counter.clone())
+    .chunk(&elements);
+
+    for (i, c) in chunks.iter().enumerate() {
+        if c.is_oversized() {
+            continue;
+        }
+        let measured = counter.count(&c.text());
+        assert!(
+            measured <= max_tokens,
+            "chunk {i}: {measured} BPE tokens over a {max_tokens}-token budget"
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -190,22 +262,30 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// I3 — HONEST BUDGET: the number stamped as a chunk's cost counts exactly
-    /// the text the library designates as embeddable.
+    /// I3 — HONEST BUDGET: the stamped cost counts exactly the text the budget
+    /// governs, which is the chunk's CONTENT (`text`) — never the metadata
+    /// wrapped around it.
     ///
-    /// `RagChunk::full_text` is that designated text (`rag.rs:23`:
-    /// "use this for embedding generation") and `token_estimate` is documented
-    /// as its token count. If they disagree, a consumer sizing against a real
-    /// embedding model's hard limit is silently over budget: the provider
-    /// truncates the tail, the tail never reaches the vector, and that content
-    /// becomes unretrievable while still sitting in the store.
+    /// The vector represents the content. Heading context, breadcrumb, document
+    /// title and page span are there to filter and to rebuild neighbourhood at
+    /// query time; embedding them dilutes the signal and spends the model's
+    /// input budget on text repeated across every chunk of a section. So
+    /// `max_tokens`, `token_estimate` and the split decision all refer to
+    /// `text`, and `full_text` is a presentation concern that no count follows.
     ///
-    /// PINNED: fails today — see issue #434. The property states the contract;
-    /// the code does not honor it yet. Remove `#[ignore]` when the fix ships and
-    /// this becomes a permanent guard. Precedent: #430.
+    /// HISTORY — why this property is stated this way. It previously asserted
+    /// the opposite: that the stamp had to measure `full_text`, "the text
+    /// designated for embedding". That phrase came from a doc-comment
+    /// (`rag.rs:23`), not from the contract, and the doc-comment was wrong. The
+    /// property inherited its error, failed against correct code, and was filed
+    /// as bug #434 — which was closed as invalid, and the doc-comment fixed.
+    ///
+    /// The lesson is the catalogue's own rule, violated here: an invariant is
+    /// derived from the contract, and a doc-comment is not the contract. When a
+    /// property fails, the possibility that the PROPERTY is wrong has to be
+    /// eliminated before the failure is written up as a defect in the code.
     #[test]
-    #[ignore = "issue #434: token_estimate does not measure full_text"]
-    fn stamped_count_measures_the_text_designated_for_embedding(
+    fn stamped_count_measures_the_content_the_budget_governs(
         elements in element_seq(),
         config in chunk_config(),
     ) {
@@ -213,11 +293,11 @@ proptest! {
         let chunks = chunk(&elements, config);
         for (i, c) in chunks.iter().enumerate() {
             let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
-            let measured = WordProxyCounter.count(&rag.full_text);
+            let measured = WordProxyCounter.count(&rag.text);
             prop_assert_eq!(
                 rag.token_estimate,
                 measured,
-                "chunk {}: stamped {} tokens, full_text measures {}",
+                "chunk {}: stamped {} tokens, content measures {}",
                 i,
                 rag.token_estimate,
                 measured
@@ -302,17 +382,21 @@ proptest! {
     /// itself flag oversized may exceed `max_tokens` when measured with the very
     /// counter that governed the split.
     ///
-    /// The split decision sums per-element counts while the stamp counts the
-    /// joined text (`hybrid_chunking.rs:296,308` vs `:271-277`). That identity
-    /// holds for whitespace counting and not for BPE.
+    /// This caught #435 (fixed): the split decision summed per-element counts
+    /// while the emitted chunk counted the joined text. Sum equals join only for
+    /// a counter that is additive across the separator — true of the whitespace
+    /// proxy, false of BPE — so the budget approved chunks whose real cost was
+    /// never measured. The decision now measures the joined text it is about to
+    /// emit, in all three places that used to do arithmetic instead: the merge
+    /// check, `split_by_sentences`, and the oversize flag on split fragments.
     ///
-    /// PINNED: fails today — see issue #435. The property states the contract;
-    /// the code does not honor it yet. Remove `#[ignore]` when the fix ships and
-    /// this becomes a permanent guard. Precedent: #430.
+    /// Generated over [`element_seq_with_empty_texts`] rather than
+    /// [`element_seq`]: an element with empty display text is what separates
+    /// "the buffer holds no elements" from "the buffered text is empty", and the
+    /// first fix conflated them. See `empty_text_elements_do_not_escape_the_budget`.
     #[test]
-    #[ignore = "issue #435: split decision sums per-element counts; BPE is not additive across the join"]
     fn no_chunk_exceeds_its_budget_under_bpe(
-        elements in element_seq(),
+        elements in element_seq_with_empty_texts(),
         config in chunk_config(),
     ) {
         let counter = tiktoken();

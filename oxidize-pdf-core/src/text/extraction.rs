@@ -2240,10 +2240,11 @@ impl TextExtractor {
                 if let Ok(decoded) =
                     crate::text::extraction_cmap::decode_text_with_font(text, font_info)
                 {
-                    // Only accept if we got meaningful text (not all null bytes or garbage)
-                    if !decoded.trim().is_empty()
-                        && !decoded.chars().all(|c| c == '\0' || c.is_ascii_control())
-                    {
+                    // Only accept if we got meaningful text (not all null bytes
+                    // or garbage). Whitespace counts as meaningful: a decode
+                    // that is exactly a space is a space, not a failed decode
+                    // (#438). See `decode_is_usable`.
+                    if crate::text::extraction_cmap::decode_is_usable(&decoded) {
                         // Apply sanitization to remove control characters (Issue #116)
                         let sanitized = sanitize_extracted_text(&decoded);
                         tracing::debug!(

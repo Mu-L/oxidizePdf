@@ -7,6 +7,27 @@ pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str) -> usize;
     /// Stable provenance identifier, e.g. `"word-proxy"` or `"cl100k_base"`.
     fn name(&self) -> &'static str;
+
+    /// Whether this counter is additive across a newline join, i.e. whether
+    /// `count(a) + count(b) == count(&format!("{a}\n{b}"))` for every `a`, `b`.
+    ///
+    /// Chunking has to know the cost of the text it is about to emit, which is
+    /// the elements joined with `"\n"`. A counter that is additive lets that be
+    /// computed by accumulation; one that is not forces the chunker to re-count
+    /// the joined text on every candidate element, which is correct but costs a
+    /// re-tokenization of the whole buffer each time.
+    ///
+    /// Defaults to `false`, the safe answer: an over-claim here silently
+    /// restores the budget bug of #435, where a sum approved a chunk whose real
+    /// cost was never measured. Whitespace counting is additive because the
+    /// separator cannot fuse two words into one; subword (BPE) counting is not,
+    /// because the join boundary re-tokenizes.
+    ///
+    /// Override only with a proof or a test. `prop_token_counter_invariants.rs`
+    /// checks every counter in this crate against its own answer.
+    fn is_additive_over_newline(&self) -> bool {
+        false
+    }
 }
 
 /// Zero-dependency default: whitespace-separated word count. Reproduces the
@@ -20,6 +41,11 @@ impl TokenCounter for WordProxyCounter {
     }
     fn name(&self) -> &'static str {
         "word-proxy"
+    }
+    /// Additive: `"\n"` is whitespace, so joining cannot merge the last word of
+    /// `a` with the first of `b`, nor create a word that was in neither.
+    fn is_additive_over_newline(&self) -> bool {
+        true
     }
 }
 

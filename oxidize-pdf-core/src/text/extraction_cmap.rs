@@ -550,6 +550,33 @@ impl<R: Read + Seek> CMapTextExtractor<R> {
     }
 }
 
+/// The whitespace `sanitize_extracted_text` keeps downstream. `decode_is_usable`
+/// uses the same set on purpose: accepting a decode that the next stage then
+/// deletes would turn "usable" into an empty string — worse than the guessed
+/// fallback it was accepted over.
+fn is_preservable_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// Whether a decode produced usable text, or nothing the caller can act on.
+///
+/// A decode is unusable only when it yielded no characters at all, or nothing
+/// but control codes that carry no text (NUL included) — the signature of
+/// reading bytes through the wrong table. Whitespace is real text: a subsetted
+/// font's first glyph is routinely the space, mapped by `/ToUnicode` to U+0020,
+/// and content streams routinely show it in a text-showing operator of its own.
+///
+/// Treating such a decode as a failure sends the caller to a *guessed* encoding,
+/// and in a subset font with no `/Encoding` the codes mean nothing outside their
+/// CMap — so the guess renders the code as its own literal ASCII, replacing every
+/// space with `!` or `"` and shredding word boundaries document-wide (#438).
+pub(crate) fn decode_is_usable(decoded: &str) -> bool {
+    !decoded.is_empty()
+        && !decoded
+            .chars()
+            .all(|c| c.is_control() && !is_preservable_whitespace(c))
+}
+
 /// Decode text using font information — free function (no allocations).
 ///
 /// Tries ToUnicode CMap first, then CID→Unicode tables for CJK fonts,
@@ -598,9 +625,9 @@ pub fn decode_text_with_font(text_bytes: &[u8], font_info: &FontInfo) -> ParseRe
                     crate::text::cid_to_unicode::CidCollection::from_ordering(ordering)
                 {
                     let result = decode_with_cid_table(text_bytes, &collection);
-                    if !result.is_empty()
-                        && !result.chars().all(|c| c == '\0' || c.is_ascii_control())
-                    {
+                    // Same predicate as the ToUnicode path — one definition so
+                    // the two acceptance rules cannot drift apart (#438).
+                    if decode_is_usable(&result) {
                         return Ok(result);
                     }
                 }
