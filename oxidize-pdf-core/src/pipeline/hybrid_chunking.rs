@@ -263,6 +263,10 @@ impl HybridChunker {
 
     /// Build a chunk, stamping its token count once over the whole chunk text
     /// with the active counter.
+    ///
+    /// The separator here and in [`join_texts`] must stay the same: the budget
+    /// decision measures the text this function will later emit, and a different
+    /// separator would make the two measurements disagree again (#435).
     fn make_chunk(
         &self,
         elements: Vec<Element>,
@@ -289,35 +293,72 @@ impl HybridChunker {
             return Vec::new();
         }
 
+        let additive = self.counter.is_additive_over_whitespace_join();
+
         let mut chunks = Vec::new();
         let mut buffer: Vec<Element> = Vec::new();
+        // Only maintained for non-additive counters, which are the only ones
+        // that need the joined string in order to measure it. Keeping it for an
+        // additive counter would copy the whole buffer per element for nothing.
+        let mut buffer_text = String::new();
         let mut buffer_tokens = 0usize;
         let mut buffer_heading: Option<String> = None;
 
         for element in elements {
-            let elem_tokens = self.counter.count(&element.display_text());
+            let elem_text = element.display_text();
+            let elem_tokens = self.counter.count(&elem_text);
             let elem_heading = if self.config.propagate_headings {
                 element.metadata().parent_heading.clone()
             } else {
                 None
             };
 
+            // Cost of the chunk this element would produce if it joined the
+            // buffer, measured over the JOINED text — the text that would
+            // actually be emitted. Summing per-element counts instead is only
+            // valid for a counter that is additive across the join separator;
+            // BPE is not, so a sum can approve a chunk whose real cost was never
+            // measured (#435).
+            //
+            // A counter that declares itself additive over the join separator
+            // makes the accumulated sum exactly equal to the joined count, so
+            // there is no reason to re-tokenize the buffer: the two agree by the
+            // counter's own contract, checked against it in
+            // `prop_token_counter_invariants.rs`. Everything else pays a
+            // re-count of the buffered text per candidate element, which is what
+            // correctness costs when `count(a) + count(b) != count(a\nb)`.
+            // Built once and reused if the merge goes ahead: it is the exact
+            // text `buffer_text` would become, and re-deriving it on the merge
+            // path would pay for a second string build and a second full
+            // re-tokenization per merged element.
+            let joined_text = (!buffer.is_empty() && !additive)
+                .then(|| append_element_text(&buffer_text, &elem_text, false));
+
+            let joined_tokens = match &joined_text {
+                Some(joined) => self.counter.count(joined),
+                None if buffer.is_empty() => elem_tokens,
+                None => buffer_tokens + elem_tokens,
+            };
+
             // Check if this element can merge with the buffer
             let can_merge = self.config.merge_adjacent
                 && !buffer.is_empty()
                 && can_merge_elements(buffer.last().unwrap(), element, &self.config.merge_policy)
-                && buffer_tokens + elem_tokens <= self.config.max_tokens;
+                && joined_tokens <= self.config.max_tokens;
 
             if can_merge {
+                if let Some(joined) = joined_text {
+                    buffer_text = joined;
+                }
                 buffer.push(element.clone());
-                buffer_tokens += elem_tokens;
+                buffer_tokens = joined_tokens;
                 continue;
             }
 
             // Can't merge — check if buffer needs flushing
             if !buffer.is_empty() {
                 // Flush if: adding would overflow, or types differ, or merge disabled
-                if buffer_tokens + elem_tokens > self.config.max_tokens
+                if joined_tokens > self.config.max_tokens
                     || !can_merge_elements(
                         buffer.last().unwrap(),
                         element,
@@ -328,6 +369,7 @@ impl HybridChunker {
                     self.flush_buffer(
                         &mut chunks,
                         &mut buffer,
+                        &mut buffer_text,
                         &mut buffer_tokens,
                         &mut buffer_heading,
                     );
@@ -341,11 +383,19 @@ impl HybridChunker {
                     let fragments =
                         split_by_sentences(&text, self.counter.as_ref(), self.config.max_tokens);
                     for fragment in fragments {
-                        let fragment_element = make_text_fragment_element(element, fragment.trim());
+                        let fragment = fragment.trim();
+                        // A single sentence longer than the budget cannot be
+                        // split any further without cutting mid-sentence, so it
+                        // is emitted whole — but it is flagged, not passed off
+                        // as within budget. Claiming `oversized: false` for a
+                        // fragment that exceeds `max_tokens` is the same lie the
+                        // budget invariant exists to catch (#435).
+                        let over = self.counter.count(fragment) > self.config.max_tokens;
+                        let fragment_element = make_text_fragment_element(element, fragment);
                         chunks.push(self.make_chunk(
                             vec![fragment_element],
                             elem_heading.clone(),
-                            false,
+                            over,
                         ));
                     }
                 } else {
@@ -355,12 +405,18 @@ impl HybridChunker {
                 continue;
             }
 
-            // Start or append to buffer
-            if buffer.is_empty() {
-                buffer_heading = elem_heading;
+            // Start a new buffer. Reaching here always means the buffer is
+            // empty: appending to a non-empty buffer only happens on the
+            // `can_merge` path above (which `continue`s), and every other way
+            // through with a non-empty buffer flushes it first — the flush
+            // condition is the exact negation of the merge condition.
+            debug_assert!(buffer.is_empty(), "buffer must be flushed before restart");
+            buffer_heading = elem_heading;
+            if !additive {
+                buffer_text = elem_text;
             }
+            buffer_tokens = elem_tokens;
             buffer.push(element.clone());
-            buffer_tokens += elem_tokens;
         }
 
         // Flush remaining
@@ -442,6 +498,7 @@ impl HybridChunker {
         &self,
         chunks: &mut Vec<HybridChunk>,
         buffer: &mut Vec<Element>,
+        buffer_text: &mut String,
         buffer_tokens: &mut usize,
         buffer_heading: &mut Option<String>,
     ) {
@@ -455,10 +512,33 @@ impl HybridChunker {
         // suite in tests/hybrid_chunker_disjoint_test.rs.
         let flushed = std::mem::take(buffer);
         let heading = buffer_heading.take();
+        buffer_text.clear();
         *buffer_tokens = 0;
 
         chunks.push(self.make_chunk(flushed, heading, false));
     }
+}
+
+/// Append one element's text to the buffered chunk text, exactly as
+/// [`HybridChunker::make_chunk`] will join the elements: `"\n"` between every
+/// pair of ELEMENTS.
+///
+/// `buffer_is_empty` is about elements, not about text, and the distinction is
+/// load-bearing. An element whose `display_text()` is empty is legal (the field
+/// is a plain `pub String`), so "the buffer holds nothing" and "the buffered
+/// text is the empty string" are different questions. Keying the separator on
+/// the second makes the budget decision measure zero while the emitted chunk
+/// keeps growing one separator at a time — those separators are real tokens
+/// under BPE, which is #435 all over again.
+///
+/// Single definition on purpose: the budget decision and the emitted chunk have
+/// to measure the same string, which they can only do by building it the same
+/// way.
+fn append_element_text(buffered: &str, next: &str, buffer_is_empty: bool) -> String {
+    if buffer_is_empty {
+        return next.to_string();
+    }
+    format!("{buffered}\n{next}")
 }
 
 /// Whether two adjacent elements can be merged according to the given policy.
@@ -495,8 +575,18 @@ fn split_by_sentences(text: &str, counter: &dyn TokenCounter, max_tokens: usize)
     // Split into sentences preserving the delimiter as part of the sentence.
     let sentences = split_into_sentences(text);
 
+    // Sentences are joined with `' '`, a single whitespace character, so a
+    // counter that declares itself additive over a whitespace join promises the
+    // sum equals the measured cost of the join — the same promise the element
+    // loop in `chunk` rests on, and checked against every counter in
+    // `prop_token_counter_invariants.rs`. Without it, every candidate costs a
+    // re-tokenization of the whole accumulated fragment.
+    let additive = counter.is_additive_over_whitespace_join();
+
     let mut fragments: Vec<String> = Vec::new();
     let mut current = String::new();
+    // Only meaningful while `current` is non-empty, and only maintained for an
+    // additive counter — the other path measures the candidate directly.
     let mut current_tokens = 0usize;
 
     for sentence in sentences {
@@ -504,20 +594,38 @@ fn split_by_sentences(text: &str, counter: &dyn TokenCounter, max_tokens: usize)
         if sentence.is_empty() {
             continue;
         }
-        let sentence_tokens = counter.count(sentence);
 
         if current.is_empty() {
             // Starting a new fragment
             current.push_str(sentence);
-            current_tokens = sentence_tokens;
-        } else if current_tokens + 1 + sentence_tokens <= max_tokens {
-            // Adding a space separator between sentences
-            current.push(' ');
-            current.push_str(sentence);
-            current_tokens += 1 + sentence_tokens;
+            current_tokens = if additive { counter.count(sentence) } else { 0 };
+            continue;
+        }
+
+        // Measure the joined candidate rather than summing the parts plus one
+        // for the separator: that arithmetic assumes an additive counter, which
+        // BPE is not (#435). For a counter that does declare additivity, the sum
+        // IS the measurement, by its own contract.
+        let sentence_tokens = counter.count(sentence);
+        let (fits, candidate) = if additive {
+            (current_tokens + sentence_tokens <= max_tokens, None)
+        } else {
+            let candidate = format!("{current} {sentence}");
+            (counter.count(&candidate) <= max_tokens, Some(candidate))
+        };
+
+        if fits {
+            match candidate {
+                Some(candidate) => current = candidate,
+                None => {
+                    current.push(' ');
+                    current.push_str(sentence);
+                    current_tokens += sentence_tokens;
+                }
+            }
         } else {
             // Current sentence doesn't fit: flush and start new fragment
-            fragments.push(current.clone());
+            fragments.push(std::mem::take(&mut current));
             current = sentence.to_string();
             current_tokens = sentence_tokens;
         }

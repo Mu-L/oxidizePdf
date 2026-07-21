@@ -7,6 +7,37 @@ pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str) -> usize;
     /// Stable provenance identifier, e.g. `"word-proxy"` or `"cl100k_base"`.
     fn name(&self) -> &'static str;
+
+    /// Whether this counter is additive across a whitespace join, i.e. whether
+    /// `count(a) + count(b) == count(&format!("{a}{sep}{b}"))` for every `a`,
+    /// `b` and every single whitespace character `sep`.
+    ///
+    /// Chunking has to know the cost of the text it is about to emit, and it
+    /// builds that text by joining pieces with one whitespace character: `"\n"`
+    /// between elements, `" "` between sentences inside an oversized element. A
+    /// counter that is additive lets that cost be computed by accumulation; one
+    /// that is not forces a re-count of the joined text on every candidate,
+    /// which is correct but costs a re-tokenization of everything buffered so
+    /// far, each time.
+    ///
+    /// The promise deliberately covers ANY whitespace separator rather than one
+    /// named character: a counter answering for `"\n"` alone would leave the
+    /// sentence-join path with no contract to stand on, and using the newline
+    /// answer there anyway would be precisely the unmeasured assumption that
+    /// #435 was.
+    ///
+    /// Defaults to `false`, the safe answer: an over-claim here silently
+    /// restores that budget bug, where a sum approved a chunk whose real cost
+    /// was never measured. Whitespace counting is additive because the
+    /// separator cannot fuse two words into one; subword (BPE) counting is not,
+    /// because the join boundary re-tokenizes.
+    ///
+    /// Override only with a proof or a test. `prop_token_counter_invariants.rs`
+    /// checks every counter in this crate against its own answer, over every
+    /// separator the promise covers.
+    fn is_additive_over_whitespace_join(&self) -> bool {
+        false
+    }
 }
 
 /// Zero-dependency default: whitespace-separated word count. Reproduces the
@@ -20,6 +51,13 @@ impl TokenCounter for WordProxyCounter {
     }
     fn name(&self) -> &'static str {
         "word-proxy"
+    }
+    /// Additive: the count is `split_whitespace().count()`, so a separator that
+    /// is itself whitespace cannot merge the last word of `a` with the first of
+    /// `b`, nor create a word that was in neither — whichever whitespace
+    /// character it is.
+    fn is_additive_over_whitespace_join(&self) -> bool {
+        true
     }
 }
 
