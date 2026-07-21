@@ -1,0 +1,516 @@
+//! Chunking-layer invariants, stated from the RAG contract (`the chunk set is a
+//! faithful partition of the input text, and every chunk is fit to be
+//! vectorized`), not from a reported bug. `HybridChunker::chunk` is a pure
+//! function of (elements, config), so the generator is cheap and the input space
+//! is large: element types × lengths × headings × five config dimensions × two
+//! token counters.
+//!
+//! Layer rule (see spec §4): an invariant lives at the cheapest layer where it
+//! is NOT tautological. `heading_path` is supplied by the caller at this layer,
+//! so asserting it here would test the test; it is guarded end-to-end by the
+//! breadcrumb property in `prop_rag_e2e_invariants.rs`. `chunk_index` is not
+//! separately guarded: production assigns it by `enumerate()`, so a
+//! contiguity assertion at any layer is structurally trivial (there is no input
+//! that makes it non-sequential) — not worth a property.
+//!
+//! Known gap, accepted: `HybridChunker::chunk_with_graph` is a second public
+//! grouping path with its own section logic and is NOT covered here (it needs an
+//! `ElementGraph`). Example guards live in `hybrid_chunking_graph_test.rs`.
+
+#[cfg(feature = "tiktoken")]
+use oxidize_pdf::pipeline::TiktokenCounter;
+use oxidize_pdf::pipeline::{
+    ContextFormat, ContextMode, Element, ElementData, ElementMetadata, HybridChunk,
+    HybridChunkConfig, HybridChunker, KeyValueElementData, MergePolicy, RagChunk, TableElementData,
+    TokenCounter, WordProxyCounter,
+};
+use proptest::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "tiktoken")]
+use std::sync::{Arc, OnceLock};
+
+/// A generated element, before it is given its position-derived marker.
+#[derive(Debug, Clone)]
+struct ElemSpec {
+    /// 0=Paragraph 1=ListItem 2=KeyValue (inline, mergeable);
+    /// 3=Title 4=Table 5=CodeBlock (structural, always start a new chunk).
+    kind: u8,
+    words: usize,
+    page: u32,
+    has_heading: bool,
+}
+
+fn elem_spec() -> impl Strategy<Value = ElemSpec> {
+    (0u8..6u8, 1usize..=60usize, 0u32..=3u32, any::<bool>()).prop_map(
+        |(kind, words, page, has_heading)| ElemSpec {
+            kind,
+            words,
+            page,
+            has_heading,
+        },
+    )
+}
+
+/// Build the element for `s` at input position `idx`.
+///
+/// The text opens with the unique marker `E{idx}_`. Markers are prefix-free
+/// thanks to the trailing `_` and a body that never contains `_`, so
+/// `text.contains("E1_")` cannot be satisfied by `E11_`.
+///
+/// Every fifth word ends in `.` so the text carries real sentence boundaries —
+/// without them `split_by_sentences` returns the whole text as one fragment and
+/// the oversized-split path (`hybrid_chunking.rs:337-356`) is never exercised.
+fn make_element(s: &ElemSpec, idx: usize) -> Element {
+    let body = (0..s.words)
+        .map(|w| {
+            if w % 5 == 4 {
+                format!("w{w}.")
+            } else {
+                format!("w{w}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = format!("E{idx}_ {body}");
+    let metadata = ElementMetadata {
+        page: s.page,
+        parent_heading: s.has_heading.then(|| format!("H{idx}")),
+        ..Default::default()
+    };
+    match s.kind {
+        0 => Element::Paragraph(ElementData { text, metadata }),
+        1 => Element::ListItem(ElementData { text, metadata }),
+        2 => Element::KeyValue(KeyValueElementData {
+            key: text,
+            value: String::from("v"),
+            metadata,
+        }),
+        3 => Element::Title(ElementData { text, metadata }),
+        4 => Element::Table(TableElementData::new(vec![vec![text]], metadata)),
+        _ => Element::CodeBlock(ElementData { text, metadata }),
+    }
+}
+
+/// As [`element_seq`], but some elements carry EMPTY text.
+///
+/// Only used by the two budget properties.
+///
+/// `ElementData.text` is a plain `pub String` with no non-empty invariant, so an
+/// element with no display text is reachable through the public API. It is also
+/// the case that separates two things a budget decision must never conflate:
+/// "the buffer holds no elements" and "the buffer's accumulated text is empty".
+/// A decision keyed on the second grows the emitted chunk while measuring zero.
+///
+/// The marker-based properties cannot use this generator (they identify elements
+/// by a marker in their text), which is exactly why the budget property carries
+/// its own: the gap was invisible to a generator that always writes a marker.
+fn element_seq_with_empty_texts() -> impl Strategy<Value = Vec<Element>> {
+    (element_seq(), prop::collection::vec(any::<bool>(), 12)).prop_map(|(mut els, blank)| {
+        for (i, el) in els.iter_mut().enumerate() {
+            if blank.get(i).copied().unwrap_or(false) {
+                match el {
+                    Element::Paragraph(d) | Element::ListItem(d) => d.text.clear(),
+                    _ => {}
+                }
+            }
+        }
+        els
+    })
+}
+
+fn element_seq() -> impl Strategy<Value = Vec<Element>> {
+    prop::collection::vec(elem_spec(), 1..=12).prop_map(|specs| {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| make_element(s, i))
+            .collect()
+    })
+}
+
+/// `max_tokens` in 4..=64 against elements of 1..=60 words: the budget is
+/// routinely smaller than a single element, so the flush, the type-boundary and
+/// the oversized-split paths all fire.
+fn chunk_config() -> impl Strategy<Value = HybridChunkConfig> {
+    (
+        4usize..=64usize,
+        any::<bool>(),
+        any::<bool>(),
+        prop_oneof![
+            Just(MergePolicy::SameTypeOnly),
+            Just(MergePolicy::AnyInlineContent)
+        ],
+        prop_oneof![
+            Just(ContextMode::None),
+            Just(ContextMode::Heading),
+            Just(ContextMode::Contextual(ContextFormat::Labeled)),
+            Just(ContextMode::Contextual(ContextFormat::Prose)),
+        ],
+    )
+        .prop_map(
+            |(max_tokens, merge_adjacent, propagate_headings, merge_policy, context_mode)| {
+                HybridChunkConfig {
+                    max_tokens,
+                    overlap_tokens: 0,
+                    merge_adjacent,
+                    propagate_headings,
+                    merge_policy,
+                    context_mode,
+                }
+            },
+        )
+}
+
+fn chunk(elements: &[Element], config: HybridChunkConfig) -> Vec<HybridChunk> {
+    HybridChunker::new(config).chunk(elements)
+}
+
+/// Word -> occurrence count. Whitespace-split, so it is robust to the chunker's
+/// legitimate reflow of separators but still catches a dropped or duplicated word.
+fn word_multiset(s: &str) -> BTreeMap<&str, usize> {
+    let mut m = BTreeMap::new();
+    for w in s.split_whitespace() {
+        *m.entry(w).or_insert(0) += 1;
+    }
+    m
+}
+
+/// Deterministic pin: a run of elements whose display text is empty must not
+/// slip past the budget check.
+///
+/// Found by review, not by the property — the generator wrote a marker into
+/// every element, so "buffer has no elements" and "buffer text is empty" never
+/// came apart. They are different questions, and a budget decision that asks the
+/// second one measures zero while the emitted chunk keeps growing: `make_chunk`
+/// joins with `"\n"`, and those separators are real tokens under BPE.
+#[cfg(feature = "tiktoken")]
+#[test]
+fn empty_text_elements_do_not_escape_the_budget() {
+    let max_tokens = 4;
+    let elements: Vec<Element> = (0..200)
+        .map(|_| {
+            Element::Paragraph(ElementData {
+                text: String::new(),
+                metadata: ElementMetadata::default(),
+            })
+        })
+        .collect();
+    let counter = tiktoken();
+    let chunks = HybridChunker::new(HybridChunkConfig {
+        max_tokens,
+        overlap_tokens: 0,
+        merge_adjacent: true,
+        propagate_headings: false,
+        merge_policy: MergePolicy::SameTypeOnly,
+        context_mode: ContextMode::None,
+    })
+    .with_token_counter(counter.clone())
+    .chunk(&elements);
+
+    for (i, c) in chunks.iter().enumerate() {
+        if c.is_oversized() {
+            continue;
+        }
+        let measured = counter.count(&c.text());
+        assert!(
+            measured <= max_tokens,
+            "chunk {i}: {measured} BPE tokens over a {max_tokens}-token budget"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I2a — IDENTITY: each input element's marker lands in exactly one chunk.
+    /// When an oversized element is split, its marker rides the first fragment,
+    /// so the count stays 1 either way.
+    #[test]
+    fn every_element_marker_lands_in_exactly_one_chunk(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let chunks = chunk(&elements, config);
+        for idx in 0..elements.len() {
+            let marker = format!("E{idx}_");
+            let hits = chunks.iter().filter(|c| c.text().contains(&marker)).count();
+            prop_assert_eq!(hits, 1, "marker {} landed in {} chunks", marker, hits);
+        }
+    }
+
+    /// I2b — CONSERVATION: the chunk set carries every input word exactly as
+    /// often as the input did. Identity alone (I2a) is satisfiable by dropping
+    /// everything but the first word of each element; conservation alone does
+    /// not localize. Both are required.
+    #[test]
+    fn chunk_text_conserves_every_input_word(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let input = elements
+            .iter()
+            .map(|e| e.display_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk(&elements, config);
+        let output = chunks.iter().map(|c| c.text()).collect::<Vec<_>>().join("\n");
+        prop_assert_eq!(word_multiset(&output), word_multiset(&input));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I3 — HONEST BUDGET: the stamped cost counts exactly the text the budget
+    /// governs, which is the chunk's CONTENT (`text`) — never the metadata
+    /// wrapped around it.
+    ///
+    /// The vector represents the content. Heading context, breadcrumb, document
+    /// title and page span are there to filter and to rebuild neighbourhood at
+    /// query time; embedding them dilutes the signal and spends the model's
+    /// input budget on text repeated across every chunk of a section. So
+    /// `max_tokens`, `token_estimate` and the split decision all refer to
+    /// `text`, and `full_text` is a presentation concern that no count follows.
+    ///
+    /// HISTORY — why this property is stated this way. It previously asserted
+    /// the opposite: that the stamp had to measure `full_text`, "the text
+    /// designated for embedding". That phrase came from a doc-comment
+    /// (`rag.rs:23`), not from the contract, and the doc-comment was wrong. The
+    /// property inherited its error, failed against correct code, and was filed
+    /// as bug #434 — which was closed as invalid, and the doc-comment fixed.
+    ///
+    /// The lesson is the catalogue's own rule, violated here: an invariant is
+    /// derived from the contract, and a doc-comment is not the contract. When a
+    /// property fails, the possibility that the PROPERTY is wrong has to be
+    /// eliminated before the failure is written up as a defect in the code.
+    #[test]
+    fn stamped_count_measures_the_content_the_budget_governs(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let mode = config.context_mode;
+        let chunks = chunk(&elements, config);
+        for (i, c) in chunks.iter().enumerate() {
+            let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
+            let measured = WordProxyCounter.count(&rag.text);
+            prop_assert_eq!(
+                rag.token_estimate,
+                measured,
+                "chunk {}: stamped {} tokens, content measures {}",
+                i,
+                rag.token_estimate,
+                measured
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I4a — ORDER: chunks come out in input-element order. Consumers rebuild
+    /// context from neighbouring chunks, so a reordering silently changes what
+    /// an LLM is handed as "the surrounding text".
+    ///
+    /// Fragments of a split element carry no marker (only the first fragment
+    /// does), so they are skipped here; they are contiguous with their marked
+    /// head by construction.
+    #[test]
+    fn chunks_come_out_in_input_element_order(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let n = elements.len();
+        let chunks = chunk(&elements, config);
+        let firsts: Vec<usize> = chunks
+            .iter()
+            .filter_map(|c| {
+                let t = c.text();
+                (0..n).find(|i| t.contains(&format!("E{i}_")))
+            })
+            .collect();
+        let mut sorted = firsts.clone();
+        sorted.sort_unstable();
+        prop_assert_eq!(&firsts, &sorted, "chunk order does not follow input order");
+    }
+
+    /// I4b — PAGE TRACEABILITY: a chunk's `page_numbers` is exactly the union of
+    /// its elements' pages. It is a filter field in the vector store: if it
+    /// lies, a page-scoped query returns incomplete results and never errors.
+    ///
+    /// Scope: because both sides are compared as `BTreeSet`s, this guards
+    /// membership — no page dropped, none foreign — but not the dedup/ordering
+    /// of the production `Vec` (the set re-sorts and re-dedups both sides). Nor
+    /// does it guard whether each element's page was assigned correctly: the
+    /// chunker does not assign pages, partition does, so a mis-assigned page is
+    /// I1's territory (E2E), not observable here where both sides read
+    /// `metadata().page` from the same elements.
+    #[test]
+    fn chunk_pages_are_the_union_of_its_elements_pages(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let mode = config.context_mode;
+        let chunks = chunk(&elements, config);
+        for (i, c) in chunks.iter().enumerate() {
+            let expected: BTreeSet<u32> =
+                c.elements().iter().map(|e| e.metadata().page).collect();
+            let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
+            let actual: BTreeSet<u32> = rag.page_numbers.iter().copied().collect();
+            prop_assert_eq!(actual, expected, "chunk {} page set", i);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I3-DEFAULT — BUDGET UNDER THE DEFAULT COUNTER: same invariant as
+    /// `no_chunk_exceeds_its_budget_under_bpe`, measured with the word proxy.
+    ///
+    /// Not a duplicate of the BPE property: the two exercise different code. The
+    /// chunker takes an O(1) accumulation path for a counter that declares itself
+    /// additive over the join separator, and a re-measure path for one that does
+    /// not. The word proxy is the only counter that declares additivity, so
+    /// without this property the entire fast path — the branch that ships by
+    /// default — is unguarded, and an arithmetic error there would surface as
+    /// exactly the over-budget chunk of #435.
+    #[test]
+    fn no_chunk_exceeds_its_budget_under_the_default_counter(
+        elements in element_seq_with_empty_texts(),
+        config in chunk_config(),
+    ) {
+        let counter = WordProxyCounter;
+        let max_tokens = config.max_tokens;
+        let chunks = HybridChunker::new(config).chunk(&elements);
+        for (i, c) in chunks.iter().enumerate() {
+            if c.is_oversized() {
+                continue;
+            }
+            let measured = counter.count(&c.text());
+            prop_assert!(
+                measured <= max_tokens,
+                "chunk {}: {} word-proxy tokens over a {}-token budget",
+                i,
+                measured,
+                max_tokens
+            );
+        }
+    }
+}
+
+/// Whether `text` holds more than one of the generator's sentences.
+///
+/// The generator writes `". "` between sentences and nowhere else, so this reads
+/// the input's own structure rather than re-deriving production's sentence
+/// parser — a test that reimplemented `split_into_sentences` would agree with it
+/// by construction and catch nothing.
+fn spans_multiple_sentences(text: &str) -> bool {
+    text.trim_end().contains(". ")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I3-SPLIT — AN OVERSIZED FRAGMENT MUST BE IRREDUCIBLE: a chunk the splitter
+    /// flagged oversized may hold at most ONE sentence.
+    ///
+    /// The budget properties cannot see this. A fragment that exceeds
+    /// `max_tokens` is emitted with `oversized: true`, and both budget properties
+    /// skip flagged chunks — correctly, since a single sentence longer than the
+    /// budget has to come out whole. But that exemption also means a splitter
+    /// that packs two sentences past the budget produces no failure anywhere: the
+    /// flag makes the overrun honest, and honesty is all the budget properties
+    /// ask for.
+    ///
+    /// So the contract is stated where it bites: the splitter is only permitted
+    /// to exceed the budget when it has no break left to take. One sentence
+    /// over budget is irreducible; two is a packing decision that went past the
+    /// budget with a break available.
+    ///
+    /// This is the property that guards the accumulation fast path in
+    /// `split_by_sentences` — verified by breaking that sum and watching this
+    /// test, and only this test, fail.
+    #[test]
+    fn an_oversized_fragment_holds_at_most_one_sentence(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let chunks = HybridChunker::new(config).chunk(&elements);
+        for (i, c) in chunks.iter().enumerate() {
+            // Only fragments of splittable elements come from the sentence
+            // splitter. A table, code block or key-value pair is emitted whole
+            // and oversized by design, with no break available to take.
+            let from_splitter = matches!(
+                c.elements(),
+                [Element::Paragraph(_)] | [Element::ListItem(_)]
+            );
+            if !c.is_oversized() || !from_splitter {
+                continue;
+            }
+            let text = c.text();
+            prop_assert!(
+                !spans_multiple_sentences(&text),
+                "chunk {i} is flagged oversized yet holds a sentence break it \
+                 could have split at: {text:?}"
+            );
+        }
+    }
+}
+
+/// cl100k_base ships multi-MB rank tables; load once for the whole suite rather
+/// than per generated case.
+#[cfg(feature = "tiktoken")]
+fn tiktoken() -> Arc<TiktokenCounter> {
+    static C: OnceLock<Arc<TiktokenCounter>> = OnceLock::new();
+    C.get_or_init(|| Arc::new(TiktokenCounter::cl100k_base()))
+        .clone()
+}
+
+// Fewer cases than the other blocks: every case runs real BPE over the whole
+// chunk set, which is orders of magnitude slower than the word proxy.
+#[cfg(feature = "tiktoken")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// I3-BPE — BUDGET UNDER THE INJECTED COUNTER: no chunk the chunker did not
+    /// itself flag oversized may exceed `max_tokens` when measured with the very
+    /// counter that governed the split.
+    ///
+    /// This caught #435 (fixed): the split decision summed per-element counts
+    /// while the emitted chunk counted the joined text. Sum equals join only for
+    /// a counter that is additive across the separator — true of the whitespace
+    /// proxy, false of BPE — so the budget approved chunks whose real cost was
+    /// never measured. The decision now measures the joined text it is about to
+    /// emit, in all three places that used to do arithmetic instead: the merge
+    /// check, `split_by_sentences`, and the oversize flag on split fragments.
+    ///
+    /// Generated over [`element_seq_with_empty_texts`] rather than
+    /// [`element_seq`]: an element with empty display text is what separates
+    /// "the buffer holds no elements" from "the buffered text is empty", and the
+    /// first fix conflated them. See `empty_text_elements_do_not_escape_the_budget`.
+    #[test]
+    fn no_chunk_exceeds_its_budget_under_bpe(
+        elements in element_seq_with_empty_texts(),
+        config in chunk_config(),
+    ) {
+        let counter = tiktoken();
+        let max_tokens = config.max_tokens;
+        let chunks = HybridChunker::new(config)
+            .with_token_counter(counter.clone())
+            .chunk(&elements);
+        for (i, c) in chunks.iter().enumerate() {
+            if c.is_oversized() {
+                continue;
+            }
+            let measured = counter.count(&c.text());
+            prop_assert!(
+                measured <= max_tokens,
+                "chunk {}: {} BPE tokens over a {}-token budget",
+                i,
+                measured,
+                max_tokens
+            );
+        }
+    }
+}

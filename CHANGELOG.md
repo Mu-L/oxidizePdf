@@ -6,6 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
+## [4.2.0] - 2026-07-21
+
+### Fixed
+
+- **A lone space decoded from `/ToUnicode` was discarded as garbage** (#438).
+  Both `/ToUnicode` paths tested a decode for usability by trimming it first, so
+  a code mapping to exactly `U+0020` trimmed to empty and was rejected — the
+  extractor then fell back to the raw code and emitted the byte as a literal
+  ASCII character, corrupting word boundaries in subsetted-font documents. The
+  simple-font and CID paths had diverging copies of that predicate; they now
+  share one, and a decode is unusable only when it produced no characters at all
+  or nothing but non-whitespace control codes. Whitespace is real text. The
+  shared predicate also tightened the CID path, which previously accepted C1
+  control codes (U+0080–U+009F) as genuine text.
+- **Chunk budgets were decided on a sum of per-element token counts** (#435).
+  The decision summed what each element cost separately while the emitted chunk
+  measured the elements joined — equal only for a counter that is additive
+  across the separator, which BPE is not. So a chunk could be approved on a cost
+  that was never measured, and exceed `max_tokens` in the tokenizer that
+  governed the split. Every budget decision now measures the text it is about to
+  emit: the merge check, the sentence splitter, and the oversize flag on split
+  fragments. A fragment that still exceeds the budget is flagged rather than
+  passed off as within it.
+- **Paragraphs ran together across a font change in extraction** (#436). A
+  change of font size or weight now ends the paragraph, so a heading set in the
+  same block as its body no longer merges into one run of text.
+
+### Added
+
+- **`TokenCounter::is_additive_over_whitespace_join`**, a defaulted trait method
+  (`false`, the safe answer) by which a counter declares that
+  `count(a) + count(b)` equals the cost of joining `a` and `b` with any single
+  whitespace character. The chunker uses it to accumulate a budget in O(1)
+  instead of re-tokenizing the whole buffer per candidate; `WordProxyCounter`,
+  the default, declares `true`, and the BPE counter correctly does not. Existing
+  implementors are unaffected — the default keeps the measured, always-correct
+  path.
+- **Property-based invariant suites for the RAG pipeline and font mapping**,
+  continuing the bug-class guards begun in 4.1.1. Chunking: the chunk set is a
+  faithful partition of the input (every element in exactly one chunk, every
+  word conserved, input order preserved, pages the union of their elements'),
+  the stamped token count measures the content the budget governs, no chunk
+  exceeds its budget under either counter, and an oversized fragment is
+  irreducible rather than over-packed. End-to-end: text conservation from
+  written PDF to chunk, and a breadcrumb that never names a later heading.
+  Fonts: the mapping invariant across every mechanism a document has for saying
+  what a code means (WinAnsi, subset `/ToUnicode`, Identity-H, CID table) plus a
+  coverage report that agrees with what survives extraction. Token counters: a
+  counter's additivity claim is verified against it, over every separator the
+  claim covers. #435, #436 and #438 were all reproduced from the contract by
+  these suites.
+
+### Changed
+
+- **`is_oversized` is now set on sentence-split fragments that exceed the
+  budget.** Previously such a fragment always reported `false`, regardless of
+  its real cost. Consumers filtering on this field will see more `true`s; that
+  is the honest answer, and the reason #435 was invisible.
+
 ## [4.1.1] - 2026-07-16
 
 ### Security
