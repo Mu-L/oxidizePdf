@@ -93,7 +93,7 @@ fn make_element(s: &ElemSpec, idx: usize) -> Element {
 
 /// As [`element_seq`], but some elements carry EMPTY text.
 ///
-/// Only used by the BPE budget property, which is feature-gated.
+/// Only used by the two budget properties.
 ///
 /// `ElementData.text` is a plain `pub String` with no non-empty invariant, so an
 /// element with no display text is reachable through the public API. It is also
@@ -104,7 +104,6 @@ fn make_element(s: &ElemSpec, idx: usize) -> Element {
 /// The marker-based properties cannot use this generator (they identify elements
 /// by a marker in their text), which is exactly why the budget property carries
 /// its own: the gap was invisible to a generator that always writes a marker.
-#[cfg(feature = "tiktoken")]
 fn element_seq_with_empty_texts() -> impl Strategy<Value = Vec<Element>> {
     (element_seq(), prop::collection::vec(any::<bool>(), 12)).prop_map(|(mut els, blank)| {
         for (i, el) in els.iter_mut().enumerate() {
@@ -359,6 +358,102 @@ proptest! {
             let rag = RagChunk::from_hybrid_chunk_with_mode(i, c, mode);
             let actual: BTreeSet<u32> = rag.page_numbers.iter().copied().collect();
             prop_assert_eq!(actual, expected, "chunk {} page set", i);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I3-DEFAULT — BUDGET UNDER THE DEFAULT COUNTER: same invariant as
+    /// `no_chunk_exceeds_its_budget_under_bpe`, measured with the word proxy.
+    ///
+    /// Not a duplicate of the BPE property: the two exercise different code. The
+    /// chunker takes an O(1) accumulation path for a counter that declares itself
+    /// additive over the join separator, and a re-measure path for one that does
+    /// not. The word proxy is the only counter that declares additivity, so
+    /// without this property the entire fast path — the branch that ships by
+    /// default — is unguarded, and an arithmetic error there would surface as
+    /// exactly the over-budget chunk of #435.
+    #[test]
+    fn no_chunk_exceeds_its_budget_under_the_default_counter(
+        elements in element_seq_with_empty_texts(),
+        config in chunk_config(),
+    ) {
+        let counter = WordProxyCounter;
+        let max_tokens = config.max_tokens;
+        let chunks = HybridChunker::new(config).chunk(&elements);
+        for (i, c) in chunks.iter().enumerate() {
+            if c.is_oversized() {
+                continue;
+            }
+            let measured = counter.count(&c.text());
+            prop_assert!(
+                measured <= max_tokens,
+                "chunk {}: {} word-proxy tokens over a {}-token budget",
+                i,
+                measured,
+                max_tokens
+            );
+        }
+    }
+}
+
+/// Whether `text` holds more than one of the generator's sentences.
+///
+/// The generator writes `". "` between sentences and nowhere else, so this reads
+/// the input's own structure rather than re-deriving production's sentence
+/// parser — a test that reimplemented `split_into_sentences` would agree with it
+/// by construction and catch nothing.
+fn spans_multiple_sentences(text: &str) -> bool {
+    text.trim_end().contains(". ")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I3-SPLIT — AN OVERSIZED FRAGMENT MUST BE IRREDUCIBLE: a chunk the splitter
+    /// flagged oversized may hold at most ONE sentence.
+    ///
+    /// The budget properties cannot see this. A fragment that exceeds
+    /// `max_tokens` is emitted with `oversized: true`, and both budget properties
+    /// skip flagged chunks — correctly, since a single sentence longer than the
+    /// budget has to come out whole. But that exemption also means a splitter
+    /// that packs two sentences past the budget produces no failure anywhere: the
+    /// flag makes the overrun honest, and honesty is all the budget properties
+    /// ask for.
+    ///
+    /// So the contract is stated where it bites: the splitter is only permitted
+    /// to exceed the budget when it has no break left to take. One sentence
+    /// over budget is irreducible; two is a packing decision that went past the
+    /// budget with a break available.
+    ///
+    /// This is the property that guards the accumulation fast path in
+    /// `split_by_sentences` — verified by breaking that sum and watching this
+    /// test, and only this test, fail.
+    #[test]
+    fn an_oversized_fragment_holds_at_most_one_sentence(
+        elements in element_seq(),
+        config in chunk_config(),
+    ) {
+        let chunks = HybridChunker::new(config).chunk(&elements);
+        for (i, c) in chunks.iter().enumerate() {
+            // Only fragments of splittable elements come from the sentence
+            // splitter. A table, code block or key-value pair is emitted whole
+            // and oversized by design, with no break available to take.
+            let from_splitter = matches!(
+                c.elements(),
+                [Element::Paragraph(_)] | [Element::ListItem(_)]
+            );
+            if !c.is_oversized() || !from_splitter {
+                continue;
+            }
+            let text = c.text();
+            prop_assert!(
+                !spans_multiple_sentences(&text),
+                "chunk {i} is flagged oversized yet holds a sentence break it \
+                 could have split at: {text:?}"
+            );
         }
     }
 }

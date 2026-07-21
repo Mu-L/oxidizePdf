@@ -293,7 +293,7 @@ impl HybridChunker {
             return Vec::new();
         }
 
-        let additive = self.counter.is_additive_over_newline();
+        let additive = self.counter.is_additive_over_whitespace_join();
 
         let mut chunks = Vec::new();
         let mut buffer: Vec<Element> = Vec::new();
@@ -327,13 +327,17 @@ impl HybridChunker {
             // `prop_token_counter_invariants.rs`. Everything else pays a
             // re-count of the buffered text per candidate element, which is what
             // correctness costs when `count(a) + count(b) != count(a\nb)`.
-            let joined_tokens = if buffer.is_empty() {
-                elem_tokens
-            } else if additive {
-                buffer_tokens + elem_tokens
-            } else {
-                self.counter
-                    .count(&append_element_text(&buffer_text, &elem_text, false))
+            // Built once and reused if the merge goes ahead: it is the exact
+            // text `buffer_text` would become, and re-deriving it on the merge
+            // path would pay for a second string build and a second full
+            // re-tokenization per merged element.
+            let joined_text = (!buffer.is_empty() && !additive)
+                .then(|| append_element_text(&buffer_text, &elem_text, false));
+
+            let joined_tokens = match &joined_text {
+                Some(joined) => self.counter.count(joined),
+                None if buffer.is_empty() => elem_tokens,
+                None => buffer_tokens + elem_tokens,
             };
 
             // Check if this element can merge with the buffer
@@ -343,8 +347,8 @@ impl HybridChunker {
                 && joined_tokens <= self.config.max_tokens;
 
             if can_merge {
-                if !additive {
-                    buffer_text = append_element_text(&buffer_text, &elem_text, false);
+                if let Some(joined) = joined_text {
+                    buffer_text = joined;
                 }
                 buffer.push(element.clone());
                 buffer_tokens = joined_tokens;
@@ -571,8 +575,19 @@ fn split_by_sentences(text: &str, counter: &dyn TokenCounter, max_tokens: usize)
     // Split into sentences preserving the delimiter as part of the sentence.
     let sentences = split_into_sentences(text);
 
+    // Sentences are joined with `' '`, a single whitespace character, so a
+    // counter that declares itself additive over a whitespace join promises the
+    // sum equals the measured cost of the join — the same promise the element
+    // loop in `chunk` rests on, and checked against every counter in
+    // `prop_token_counter_invariants.rs`. Without it, every candidate costs a
+    // re-tokenization of the whole accumulated fragment.
+    let additive = counter.is_additive_over_whitespace_join();
+
     let mut fragments: Vec<String> = Vec::new();
     let mut current = String::new();
+    // Only meaningful while `current` is non-empty, and only maintained for an
+    // additive counter — the other path measures the candidate directly.
+    let mut current_tokens = 0usize;
 
     for sentence in sentences {
         let sentence = sentence.trim();
@@ -583,19 +598,36 @@ fn split_by_sentences(text: &str, counter: &dyn TokenCounter, max_tokens: usize)
         if current.is_empty() {
             // Starting a new fragment
             current.push_str(sentence);
+            current_tokens = if additive { counter.count(sentence) } else { 0 };
             continue;
         }
 
         // Measure the joined candidate rather than summing the parts plus one
         // for the separator: that arithmetic assumes an additive counter, which
-        // BPE is not (#435).
-        let candidate = format!("{current} {sentence}");
-        if counter.count(&candidate) <= max_tokens {
-            current = candidate;
+        // BPE is not (#435). For a counter that does declare additivity, the sum
+        // IS the measurement, by its own contract.
+        let sentence_tokens = counter.count(sentence);
+        let (fits, candidate) = if additive {
+            (current_tokens + sentence_tokens <= max_tokens, None)
+        } else {
+            let candidate = format!("{current} {sentence}");
+            (counter.count(&candidate) <= max_tokens, Some(candidate))
+        };
+
+        if fits {
+            match candidate {
+                Some(candidate) => current = candidate,
+                None => {
+                    current.push(' ');
+                    current.push_str(sentence);
+                    current_tokens += sentence_tokens;
+                }
+            }
         } else {
             // Current sentence doesn't fit: flush and start new fragment
             fragments.push(std::mem::take(&mut current));
             current = sentence.to_string();
+            current_tokens = sentence_tokens;
         }
     }
 
