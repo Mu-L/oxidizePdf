@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Flat-path separator heuristics measured pen movement in post-CTM user
-  space, corrupting line structure under a rotated or sheared CTM** (#443).
+  space, corrupting line structure under a rotated CTM** (#443).
   A plain forward advance along a rotated baseline changes the user-space y,
   which the newline gate misread as a line change (spurious newlines
   everywhere), and the rotation gave every same-baseline glyph a nonzero Δy,
@@ -21,10 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   axis-aligned content the projection is exactly the previous Δx/Δy — no
   behavior change — and under rotation it recovers the text's own line
   geometry, so all the `Tj`/`TJ` separator gates (newline threshold, space
-  threshold, backward-jump wrap) now hold for rotated text. The tracked pen
-  position is the full post-advance point, so rotated baselines advance y as
-  well as x. Degenerate (zero-length or non-finite) baselines fall back to
-  raw user-space deltas. The two line-structure invariants pinned to #443
+  threshold, backward-jump wrap) now hold for rotated text. Mirrored
+  (negative-x-scale) baselines now measure Δx along the text's own advance
+  direction, so plain forward advances no longer misfire the backward-jump
+  wrap gate. Axis-aligned shear projects exactly; shear combined with a
+  rotated baseline is approximated. The tracked pen position is the full
+  post-advance point, so rotated baselines advance y as well as x.
+  Degenerate (zero-length or non-finite) baselines fall back to raw
+  user-space deltas. The two line-structure invariants pinned to #443
   (rotation property + 20° deterministic pin) flip from `#[ignore]` to
   permanent guards.
 - **A same-line backward X jump was misread as a line wrap** (#441). The

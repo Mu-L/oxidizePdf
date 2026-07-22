@@ -243,6 +243,36 @@ fn issue_443_rotated_page_keeps_single_line() {
     );
 }
 
+/// Deterministic pin for the mirrored-baseline behavior change of the #443
+/// fix: under a negative-x-scale CTM, `dx` is measured along the text's own
+/// advance direction, so a plain forward advance no longer misfires the
+/// backward-jump wrap gate (pre-#443 it saw raw `dx < 0` and inserted a
+/// newline once the advance exceeded 2× the threshold). One drawn baseline
+/// must come out as exactly one line, glyphs in draw order.
+#[test]
+fn mirrored_baseline_stays_a_single_line() {
+    let (inner, drawn) = emit_line_structure(&[(vec![0, 1, 2], None, 13.0)]);
+    let mut content = Vec::new();
+    content.extend_from_slice(b"q\n-1 0 0 1 612 0 cm\n");
+    content.extend_from_slice(&inner);
+    content.extend_from_slice(b"Q\n");
+    let flat = extract(&wrap_pdf(&content), false);
+    assert_eq!(
+        output_line_structure(&flat),
+        drawn,
+        "mirrored single-baseline page must extract as one line\n--- flat ---\n{flat}"
+    );
+    // The observable delta vs the pre-#443 code: word gaps advance the pen
+    // LEFT in raw user space, so the old dx-based space gate never fired and
+    // words came out glued ("loremipsum"). Projected onto the baseline the
+    // gap is a positive forward dx and the space is inserted.
+    let (w0, w1) = (WORDS[0], WORDS[1]);
+    assert!(
+        flat.contains(&format!("{w0} {w1}")),
+        "mirrored word gap must still produce a space\n--- flat ---\n{flat}"
+    );
+}
+
 // ---- Drift-chain builder for the #425 token-contiguity property. ----------
 
 fn build_drift_page(n_lines: usize, token_line: usize, token: &str, drift_step: f64) -> Vec<u8> {

@@ -2532,10 +2532,20 @@ const SAME_LINE_EPS: f64 = 1e-6;
 /// text rendering matrix `Tm × CTM`. For an axis-aligned matrix
 /// (identity/translation/positive scale — the overwhelming majority of
 /// content) the baseline IS the user-space x-axis and this returns exactly
-/// `(Δx, Δy)`, the pre-#443 behavior. Under a rotated or sheared CTM the
-/// projection recovers the text's own line geometry, which raw user-space
-/// deltas conflate: a plain forward advance along a rotated baseline changes
-/// the user-space y, which the separator heuristics misread as a line change.
+/// `(Δx, Δy)`, the pre-#443 behavior. Under a rotated CTM (and any
+/// similarity transform) the projection recovers the text's own line
+/// geometry exactly, which raw user-space deltas conflate: a plain forward
+/// advance along a rotated baseline changes the user-space y, which the
+/// separator heuristics misread as a line change. Axis-aligned shear
+/// (`b == 0`, `c != 0`) also projects exactly (the perpendicular reduces to
+/// the y-axis); a shear COMBINED with a rotated baseline is approximated —
+/// the perpendicular is built by rotating the baseline 90°, not from the
+/// true image of the text-space y-axis.
+///
+/// A mirrored baseline (negative x-scale) measures `dx` along the text's own
+/// advance direction, so a forward advance is positive `dx` — the spacing
+/// and wrap gates apply as for unmirrored text (pre-#443 they saw a raw
+/// negative `dx` and misfired the wrap gate on plain advances).
 ///
 /// A degenerate baseline (zero-length or non-finite) falls back to the raw
 /// user-space deltas, preserving pre-#443 behavior for malformed matrices.
@@ -2983,6 +2993,58 @@ fn standard_14_space_width(base_font: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── issue #443: baseline-frame pen deltas ────────────────────────────────
+
+    fn state_with_ctm(ctm: [f64; 6]) -> TextState {
+        TextState {
+            ctm,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pen_delta_identity_matrix_returns_raw_deltas() {
+        let state = state_with_ctm([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let (dx, dy) = pen_delta(&state, (10.0, 20.0), (14.5, 17.0));
+        assert_eq!((dx, dy), (4.5, -3.0), "axis-aligned = raw Δx/Δy exactly");
+    }
+
+    #[test]
+    fn pen_delta_rotation_recovers_text_space_advance() {
+        // 30° rotation; the pen advances 5 units along the rotated baseline.
+        let (s30, c30) = 30f64.to_radians().sin_cos();
+        let state = state_with_ctm([c30, s30, -s30, c30, 0.0, 0.0]);
+        let (dx, dy) = pen_delta(&state, (0.0, 0.0), (5.0 * c30, 5.0 * s30));
+        assert!((dx - 5.0).abs() < 1e-12, "advance recovered: {dx}");
+        assert!(dy.abs() < 1e-12, "same baseline → dy ≈ 0: {dy}");
+        assert!(
+            dy.abs() < SAME_LINE_EPS,
+            "noise below the same-line epsilon"
+        );
+    }
+
+    #[test]
+    fn pen_delta_mirrored_baseline_measures_advance_direction() {
+        // Horizontal mirror: a forward text-space advance moves the pen LEFT
+        // in user space. dx must still be positive (the text's own advance
+        // direction), so the wrap gate does not misfire on plain advances.
+        let state = state_with_ctm([-1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let (dx, dy) = pen_delta(&state, (100.0, 50.0), (95.0, 50.0));
+        assert_eq!(dx, 5.0, "forward advance is positive along the baseline");
+        assert_eq!(dy.abs(), 0.0, "same baseline");
+    }
+
+    #[test]
+    fn pen_delta_degenerate_matrix_falls_back_to_raw_deltas() {
+        // Zero baseline (a=b=0): projection impossible → raw user-space
+        // deltas, the pre-#443 behavior.
+        let state = state_with_ctm([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(pen_delta(&state, (1.0, 2.0), (4.0, 6.0)), (3.0, 4.0));
+        // Non-finite baseline: same fallback.
+        let nan_state = state_with_ctm([f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(pen_delta(&nan_state, (1.0, 2.0), (4.0, 6.0)), (3.0, 4.0));
+    }
 
     // ── issue #382: per-page byte-budget helper ──────────────────────────────
 
