@@ -1036,9 +1036,13 @@ impl TextExtractor {
                                 // When the line height is below `newline_threshold`
                                 // the dy check alone misses it, so treat a backward
                                 // dx beyond one line-height (2× the threshold,
-                                // conservative) as a newline regardless of dy
-                                // (issue #390).
-                                let line_wrap = dx < -(self.options.newline_threshold * 2.0);
+                                // conservative) as a newline even when dy is small
+                                // (issue #390). A wrap always lands on a different
+                                // baseline, so require a nonzero dy: a strictly
+                                // same-line backward jump is glyph repositioning,
+                                // never a wrap (issue #441).
+                                let line_wrap =
+                                    dy > 0.0 && dx < -(self.options.newline_threshold * 2.0);
                                 if dy > self.options.newline_threshold || line_wrap {
                                     Some('\n')
                                 } else if dx > self.options.space_threshold * state.font_size {
@@ -1128,9 +1132,13 @@ impl TextExtractor {
                                     // word that a TJ array draws as several positioned
                                     // pieces. A *backward* dx beyond one line-height
                                     // (2× the threshold, conservative) is a wrap, not a
-                                    // kern, so it is safe to break there.
-                                    let line_wrap =
-                                        (x - last_x) < -(self.options.newline_threshold * 2.0);
+                                    // kern, so it is safe to break there — but only when
+                                    // the pen also moved vertically: a wrap always lands
+                                    // on a different baseline, so a strictly same-line
+                                    // backward jump is glyph repositioning, never a wrap
+                                    // (issue #441).
+                                    let line_wrap = (y - last_y).abs() > 0.0
+                                        && (x - last_x) < -(self.options.newline_threshold * 2.0);
                                     if !skip_text {
                                         let separator = if !extracted_text.is_empty()
                                             && ((y - last_y).abs() > self.options.newline_threshold
