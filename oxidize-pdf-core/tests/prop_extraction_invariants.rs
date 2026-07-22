@@ -232,7 +232,6 @@ fn output_line_structure(text: &str) -> Vec<String> {
 /// #441 gate (the rotated advance gives every glyph a nonzero user-space Δy)
 /// and the output splits into several lines.
 #[test]
-#[ignore = "issue #443: flat-path separator heuristics measure post-CTM user space; rotated text gains spurious newlines"]
 fn issue_443_rotated_page_keeps_single_line() {
     let lines = vec![(vec![0, 1], Some((2, 35.0)), 13.0)];
     let (pdf, drawn) = build_rotated_line_structure_page(&lines, 20.0);
@@ -241,6 +240,36 @@ fn issue_443_rotated_page_keeps_single_line() {
         output_line_structure(&flat),
         drawn,
         "rotated single-baseline page must extract as one line (#443)\n--- flat ---\n{flat}"
+    );
+}
+
+/// Deterministic pin for the mirrored-baseline behavior change of the #443
+/// fix: under a negative-x-scale CTM, `dx` is measured along the text's own
+/// advance direction, so a plain forward advance no longer misfires the
+/// backward-jump wrap gate (pre-#443 it saw raw `dx < 0` and inserted a
+/// newline once the advance exceeded 2× the threshold). One drawn baseline
+/// must come out as exactly one line, glyphs in draw order.
+#[test]
+fn mirrored_baseline_stays_a_single_line() {
+    let (inner, drawn) = emit_line_structure(&[(vec![0, 1, 2], None, 13.0)]);
+    let mut content = Vec::new();
+    content.extend_from_slice(b"q\n-1 0 0 1 612 0 cm\n");
+    content.extend_from_slice(&inner);
+    content.extend_from_slice(b"Q\n");
+    let flat = extract(&wrap_pdf(&content), false);
+    assert_eq!(
+        output_line_structure(&flat),
+        drawn,
+        "mirrored single-baseline page must extract as one line\n--- flat ---\n{flat}"
+    );
+    // The observable delta vs the pre-#443 code: word gaps advance the pen
+    // LEFT in raw user space, so the old dx-based space gate never fired and
+    // words came out glued ("loremipsum"). Projected onto the baseline the
+    // gap is a positive forward dx and the space is inserted.
+    let (w0, w1) = (WORDS[0], WORDS[1]);
+    assert!(
+        flat.contains(&format!("{w0} {w1}")),
+        "mirrored word gap must still produce a space\n--- flat ---\n{flat}"
     );
 }
 
@@ -375,7 +404,6 @@ proptest! {
     /// plain forward advance exceed `newline_threshold` vertically. Becomes a
     /// permanent guard when #443 is fixed (pen deltas measured in text space).
     #[test]
-    #[ignore = "issue #443: flat-path separator heuristics measure post-CTM user space; rotated text gains spurious newlines"]
     fn flat_line_structure_survives_rotation(
         lines in prop::collection::vec(
             (
