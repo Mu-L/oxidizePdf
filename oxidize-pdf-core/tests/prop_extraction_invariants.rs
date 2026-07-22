@@ -17,6 +17,13 @@
 //!      (#389, #403, #408, #417, #422, #425). (Distinct from #2: scattering a
 //!      token preserves the character multiset but breaks contiguity.)
 //!   4. DETERMINISM — extracting the same bytes twice yields identical text.
+//!   5. LINE STRUCTURE — the newline structure of the flat extraction matches
+//!      the lines actually drawn: glyphs drawn on one baseline stay on one
+//!      output line (no spurious newline, #441), and glyphs drawn on distinct
+//!      baselines end up on distinct output lines whenever the transition is
+//!      geometrically detectable (no missing newline, #390). Unlike #1-#4,
+//!      this oracle does NOT filter whitespace away — it is the only invariant
+//!      that can see separator bugs, the class where #438 and #441 escaped.
 
 use oxidize_pdf::parser::{ParseOptions, PdfReader};
 use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
@@ -74,9 +81,9 @@ fn wrap_pdf(content: &[u8]) -> Vec<u8> {
         b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
     );
     let xref_pos = pdf.len();
-    write!(pdf, "xref\n0 6\n0000000000 65535 f \n").unwrap();
+    writeln!(pdf, "xref\n0 6\n0000000000 65535 f ").unwrap();
     for off in &offsets {
-        write!(pdf, "{off:010} 00000 n \n").unwrap();
+        writeln!(pdf, "{off:010} 00000 n ").unwrap();
     }
     write!(
         pdf,
@@ -132,6 +139,62 @@ fn build_page(spec: &[(Vec<usize>, Option<usize>)]) -> (Vec<u8>, String) {
         y -= LEADING;
     }
     (wrap_pdf(&content), drawn)
+}
+
+// ---- Line-structure builder for the #390/#441 separator property. ----------
+
+/// One generated line: word indices, an optional same-line backward
+/// "correction" (word index + backward jump in pt), and the leading below it.
+type LineSpec = (Vec<usize>, Option<(usize, f64)>, f64);
+
+/// Build a page whose line structure is known by construction, and return
+/// (pdf_bytes, glyphs-per-line in draw order).
+///
+/// Every line starts at x=50 and ends with its pen well right of the margin
+/// (≥ 2 words), so each line transition is geometrically detectable: either
+/// dy > newline_threshold (10pt), or a tight leading (dy < 10pt, nonzero)
+/// combined with a wrap back to x=50 of more than 2× the threshold — the #390
+/// class. A correction re-draws a word backward ON THE SAME baseline
+/// (dy = 0, dx < -(2 × threshold)) mid-line — the #441 class — and must NOT
+/// break the line.
+fn build_line_structure_page(lines: &[LineSpec]) -> (Vec<u8>, Vec<String>) {
+    let mut content = Vec::new();
+    let mut drawn_lines = Vec::new();
+    let mut y = 760.0;
+    for (word_idxs, correction, leading) in lines {
+        let mut x = 50.0;
+        let mut line = String::new();
+        for (pos, &wi) in word_idxs.iter().enumerate() {
+            let w = WORDS[wi % WORDS.len()];
+            x = emit_glyphs(&mut content, w, x, y);
+            line.push_str(w);
+            x += 8.0;
+            // After the first word, optionally jump BACKWARD on the same
+            // baseline and draw a correction word there (the #441 signature),
+            // then resume forward past everything drawn so far.
+            if pos == 0 {
+                if let Some((ci, back)) = correction {
+                    let w2 = WORDS[ci % WORDS.len()];
+                    let corr_x = (x - back).max(5.0);
+                    emit_glyphs(&mut content, w2, corr_x, y);
+                    line.push_str(w2);
+                    x += 30.0;
+                }
+            }
+        }
+        drawn_lines.push(line);
+        y -= leading;
+    }
+    (wrap_pdf(&content), drawn_lines)
+}
+
+/// Non-whitespace glyph runs per output line. Empty entries are kept: a
+/// blank output line (e.g. a doubled newline) is itself a structure defect
+/// and must surface as a mismatch, not be silently absorbed.
+fn output_line_structure(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+        .collect()
 }
 
 // ---- Drift-chain builder for the #425 token-contiguity property. ----------
@@ -230,6 +293,31 @@ proptest! {
                 token, flat, reordered
             );
         }
+    }
+
+    /// INV-5 LINE STRUCTURE: flat extraction reproduces exactly the lines that
+    /// were drawn — one output line per baseline, glyphs in draw order. Fails
+    /// on a spurious newline (same-line backward jump misread as a wrap, #441)
+    /// AND on a missing newline (tight-leading wrap glued, #390).
+    #[test]
+    fn flat_line_structure_matches_drawn_lines(
+        lines in prop::collection::vec(
+            (
+                prop::collection::vec(0usize..10, 2..5),
+                prop::option::of((0usize..10, 30.0f64..60.0)),
+                prop_oneof![2.0f64..9.5, 12.0f64..30.0],
+            ),
+            3..12,
+        ),
+    ) {
+        let (pdf, drawn) = build_line_structure_page(&lines);
+        let flat = extract(&pdf, false);
+        let got = output_line_structure(&flat);
+        prop_assert_eq!(
+            &got, &drawn,
+            "extracted line structure differs from drawn lines\n--- flat ---\n{}",
+            flat
+        );
     }
 
     /// INV-4 DETERMINISM: extracting the same bytes twice is identical.

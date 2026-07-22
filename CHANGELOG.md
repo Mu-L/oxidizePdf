@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
+## [Unreleased]
+
+### Fixed
+
+- **A same-line backward X jump was misread as a line wrap** (#441). The
+  flat-path heuristic added for #390 treated any backward pen jump beyond
+  2× `newline_threshold` as a wrap, ignoring Δy — so glyphs repositioned
+  backward on the same baseline (justification, out-of-order emission) gained
+  a spurious newline mid-word. In axis-aligned text a wrap always lands on a
+  different baseline: the heuristic now also requires a nonzero Δy, in both
+  the `Tj` and `TJ` handlers. Tight-leading wraps (small but nonzero Δy, the
+  #390 class) still break. Δy is measured in post-CTM user space, so text
+  under a rotated/sheared CTM is not protected by this gate (a preexisting
+  limitation of the flat-path heuristic, unchanged by this fix). A new
+  line-structure property invariant guards both directions —
+  spurious and missing newlines — against generated layouts whose true line
+  structure is known by construction.
+
 ## [4.2.0] - 2026-07-21
 
 ### Fixed
