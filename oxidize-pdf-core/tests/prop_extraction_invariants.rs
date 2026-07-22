@@ -188,11 +188,12 @@ fn build_line_structure_page(lines: &[LineSpec]) -> (Vec<u8>, Vec<String>) {
     (wrap_pdf(&content), drawn_lines)
 }
 
-/// Non-whitespace glyph runs per output line, empty lines dropped.
+/// Non-whitespace glyph runs per output line. Empty entries are kept: a
+/// blank output line (e.g. a doubled newline) is itself a structure defect
+/// and must surface as a mismatch, not be silently absorbed.
 fn output_line_structure(text: &str) -> Vec<String> {
     text.lines()
         .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
-        .filter(|l| !l.is_empty())
         .collect()
 }
 

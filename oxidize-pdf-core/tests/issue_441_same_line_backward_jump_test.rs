@@ -115,13 +115,15 @@ fn tj_array_same_line_backward_jump_gets_no_newline() {
 
 #[test]
 fn backward_jump_with_small_nonzero_dy_still_breaks_line() {
-    // Boundary pin: the #390 class (tight leading, Δy = 2pt nonzero but far
-    // below newline_threshold = 10, plus a big backward jump) must STILL be
-    // treated as a wrap. The #441 fix only excludes Δy == 0.
+    // Boundary pin: the #441 fix excludes exactly Δy == 0, nothing more. A
+    // backward jump with Δy = 0.1pt — barely nonzero, far below
+    // newline_threshold = 10 — must STILL be treated as a wrap (the #390
+    // class). Pinning this close to the cutoff means a future regression to
+    // e.g. `dy > 1.0` fails here instead of slipping through.
     let content = concat!(
         "BT\n/F1 8 Tf\n",
         "1 0 0 1 300 700 Tm\n(tail) Tj\n",
-        "1 0 0 1 50 698 Tm\n(head) Tj\nET"
+        "1 0 0 1 50 699.9 Tm\n(head) Tj\nET"
     );
     let text = extract_flat(content);
     assert!(
