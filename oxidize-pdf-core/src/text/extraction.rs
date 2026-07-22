@@ -1028,8 +1028,11 @@ impl TextExtractor {
                         // Add spacing based on position change
                         if !skip_text {
                             let separator = if !extracted_text.is_empty() {
-                                let dx = x - last_x;
-                                let dy = (y - last_y).abs();
+                                // Baseline-frame deltas (issue #443): identical
+                                // to raw Δx/Δy for axis-aligned matrices,
+                                // rotation-normalized otherwise.
+                                let (dx, dy_signed) = pen_delta(&state, (last_x, last_y), (x, y));
+                                let dy = dy_signed.abs();
 
                                 // A large backward jump in x is a line wrap: the
                                 // pen returns to the left margin on a new line.
@@ -1037,16 +1040,14 @@ impl TextExtractor {
                                 // the dy check alone misses it, so treat a backward
                                 // dx beyond one line-height (2× the threshold,
                                 // conservative) as a newline even when dy is small
-                                // (issue #390). In axis-aligned text a wrap always
-                                // lands on a different baseline, so require a
-                                // nonzero dy: a strictly same-line backward jump
-                                // is glyph repositioning, not a wrap (issue #441).
-                                // Note: dy is measured in post-CTM user space, so
-                                // a rotated/sheared CTM gives same-baseline glyphs
-                                // a nonzero dy and this gate does not protect
-                                // rotated text (preexisting limitation).
-                                let line_wrap =
-                                    dy > 0.0 && dx < -(self.options.newline_threshold * 2.0);
+                                // (issue #390). A wrap always lands on a different
+                                // baseline, so require a nonzero dy: a strictly
+                                // same-line backward jump is glyph repositioning,
+                                // not a wrap (issue #441). dy is baseline-relative
+                                // (issue #443), so this holds under rotation too;
+                                // the epsilon absorbs projection rounding noise.
+                                let line_wrap = dy > SAME_LINE_EPS
+                                    && dx < -(self.options.newline_threshold * 2.0);
                                 if dy > self.options.newline_threshold || line_wrap {
                                     Some('\n')
                                 } else if dx > self.options.space_threshold * state.font_size {
@@ -1102,10 +1103,9 @@ impl TextExtractor {
                         }
 
                         // Advance the text matrix and track the true post-advance
-                        // pen x (folds in Tz and CTM x-scale, issue #386). `last_y`
-                        // stays the shown-text origin y for line detection.
-                        last_x = advance_pen(&mut state, text_width);
-                        last_y = y;
+                        // pen point (folds in Tz and CTM scale, issue #386; a
+                        // full point so rotated baselines advance y too, #443).
+                        (last_x, last_y) = advance_pen(&mut state, text_width);
                     }
                 }
 
@@ -1137,18 +1137,20 @@ impl TextExtractor {
                                     // pieces. A *backward* dx beyond one line-height
                                     // (2× the threshold, conservative) is a wrap, not a
                                     // kern, so it is safe to break there — but only when
-                                    // the pen also moved vertically: in axis-aligned
-                                    // text a wrap always lands on a different baseline,
-                                    // so a strictly same-line backward jump is glyph
-                                    // repositioning, not a wrap (issue #441). dy is
-                                    // post-CTM user space, so this gate does not
-                                    // protect rotated text (preexisting limitation).
-                                    let line_wrap = (y - last_y).abs() > 0.0
-                                        && (x - last_x) < -(self.options.newline_threshold * 2.0);
+                                    // the pen also moved vertically: a wrap always lands
+                                    // on a different baseline, so a strictly same-line
+                                    // backward jump is glyph repositioning, not a wrap
+                                    // (issue #441). Deltas are baseline-relative (issue
+                                    // #443), so both gates hold under rotation; the
+                                    // epsilon absorbs projection rounding noise.
+                                    let (dx, dy_signed) =
+                                        pen_delta(&state, (last_x, last_y), (x, y));
+                                    let dy = dy_signed.abs();
+                                    let line_wrap = dy > SAME_LINE_EPS
+                                        && dx < -(self.options.newline_threshold * 2.0);
                                     if !skip_text {
                                         let separator = if !extracted_text.is_empty()
-                                            && ((y - last_y).abs() > self.options.newline_threshold
-                                                || line_wrap)
+                                            && (dy > self.options.newline_threshold || line_wrap)
                                         {
                                             Some('\n')
                                         } else {
@@ -1196,9 +1198,8 @@ impl TextExtractor {
                                     // Keep the pen position in sync so a following
                                     // `Tj`/`TJ` measures its gap from the right origin
                                     // (issue #381: a stale `last_y` dropped newlines;
-                                    // issue #386: `last_x` must fold in Tz/CTM scale).
-                                    last_x = advance_pen(&mut state, text_width);
-                                    last_y = y;
+                                    // issue #386: the pen must fold in Tz/CTM scale).
+                                    (last_x, last_y) = advance_pen(&mut state, text_width);
                                 }
                                 TextElement::Spacing(adjustment) => {
                                     // Text position adjustment (negative = move left,
@@ -1329,8 +1330,7 @@ impl TextExtractor {
                             );
                         }
 
-                        last_x = advance_pen(&mut state, text_width);
-                        last_y = y;
+                        (last_x, last_y) = advance_pen(&mut state, text_width);
                     }
                 }
 
@@ -1397,8 +1397,7 @@ impl TextExtractor {
                             );
                         }
 
-                        last_x = advance_pen(&mut state, text_width);
-                        last_y = y;
+                        (last_x, last_y) = advance_pen(&mut state, text_width);
                     }
                 }
 
@@ -2510,10 +2509,47 @@ fn text_origin(state: &TextState) -> (f64, f64) {
 /// space decisions) must therefore come from the post-advance pen origin, not
 /// from `origin_x + text_width`, which ignores both factors and trails the
 /// real pen whenever `Tz != 100` or the CTM scales x (issue #386).
-fn advance_pen(state: &mut TextState, text_width: f64) -> f64 {
+fn advance_pen(state: &mut TextState, text_width: f64) -> (f64, f64) {
     let tx = text_width * state.horizontal_scale / 100.0;
     state.text_matrix = multiply_matrix(&[1.0, 0.0, 0.0, 1.0, tx, 0.0], &state.text_matrix);
-    text_origin(state).0
+    text_origin(state)
+}
+
+/// Projection-noise floor for the perpendicular pen delta. Same-baseline
+/// glyph runs produce a `dy` that is exactly 0 in real arithmetic but can
+/// carry ~1e-13 of float rounding after the baseline projection; anything
+/// below this epsilon is "the same baseline". The smallest meaningful
+/// leading in real documents is orders of magnitude above it.
+const SAME_LINE_EPS: f64 = 1e-6;
+
+/// Pen movement from the previous post-advance pen point `last` to the
+/// current glyph origin `cur` (both user space), measured in the frame of the
+/// current text baseline (issue #443): `dx` along the baseline direction,
+/// `dy` perpendicular to it (signed; callers take `.abs()` for line
+/// detection).
+///
+/// The baseline direction is the image of the text-space x-axis under the
+/// text rendering matrix `Tm × CTM`. For an axis-aligned matrix
+/// (identity/translation/positive scale — the overwhelming majority of
+/// content) the baseline IS the user-space x-axis and this returns exactly
+/// `(Δx, Δy)`, the pre-#443 behavior. Under a rotated or sheared CTM the
+/// projection recovers the text's own line geometry, which raw user-space
+/// deltas conflate: a plain forward advance along a rotated baseline changes
+/// the user-space y, which the separator heuristics misread as a line change.
+///
+/// A degenerate baseline (zero-length or non-finite) falls back to the raw
+/// user-space deltas, preserving pre-#443 behavior for malformed matrices.
+fn pen_delta(state: &TextState, last: (f64, f64), cur: (f64, f64)) -> (f64, f64) {
+    let dxu = cur.0 - last.0;
+    let dyu = cur.1 - last.1;
+    let m = multiply_matrix(&state.text_matrix, &state.ctm);
+    let (bx, by) = (m[0], m[1]);
+    let norm = (bx * bx + by * by).sqrt();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return (dxu, dyu);
+    }
+    let (ux, uy) = (bx / norm, by / norm);
+    (dxu * ux + dyu * uy, -dxu * uy + dyu * ux)
 }
 
 /// Multiply two transformation matrices

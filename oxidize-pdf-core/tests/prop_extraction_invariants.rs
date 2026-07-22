@@ -232,7 +232,6 @@ fn output_line_structure(text: &str) -> Vec<String> {
 /// #441 gate (the rotated advance gives every glyph a nonzero user-space Δy)
 /// and the output splits into several lines.
 #[test]
-#[ignore = "issue #443: flat-path separator heuristics measure post-CTM user space; rotated text gains spurious newlines"]
 fn issue_443_rotated_page_keeps_single_line() {
     let lines = vec![(vec![0, 1], Some((2, 35.0)), 13.0)];
     let (pdf, drawn) = build_rotated_line_structure_page(&lines, 20.0);
@@ -375,7 +374,6 @@ proptest! {
     /// plain forward advance exceed `newline_threshold` vertically. Becomes a
     /// permanent guard when #443 is fixed (pen deltas measured in text space).
     #[test]
-    #[ignore = "issue #443: flat-path separator heuristics measure post-CTM user space; rotated text gains spurious newlines"]
     fn flat_line_structure_survives_rotation(
         lines in prop::collection::vec(
             (
