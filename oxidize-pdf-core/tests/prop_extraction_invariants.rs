@@ -24,6 +24,10 @@
 //!      geometrically detectable (no missing newline, #390). Unlike #1-#4,
 //!      this oracle does NOT filter whitespace away — it is the only invariant
 //!      that can see separator bugs, the class where #438 and #441 escaped.
+//!   6. LINE STRUCTURE UNDER ROTATION — the same oracle under a rotated CTM:
+//!      a rigid page rotation must not change the extracted line structure.
+//!      PINNED `#[ignore]` to open issue #443 (separator heuristics measure
+//!      post-CTM user space); flips to a permanent guard when it is fixed.
 
 use oxidize_pdf::parser::{ParseOptions, PdfReader};
 use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
@@ -157,7 +161,7 @@ type LineSpec = (Vec<usize>, Option<(usize, f64)>, f64);
 /// class. A correction re-draws a word backward ON THE SAME baseline
 /// (dy = 0, dx < -(2 × threshold)) mid-line — the #441 class — and must NOT
 /// break the line.
-fn build_line_structure_page(lines: &[LineSpec]) -> (Vec<u8>, Vec<String>) {
+fn emit_line_structure(lines: &[LineSpec]) -> (Vec<u8>, Vec<String>) {
     let mut content = Vec::new();
     let mut drawn_lines = Vec::new();
     let mut y = 760.0;
@@ -185,7 +189,32 @@ fn build_line_structure_page(lines: &[LineSpec]) -> (Vec<u8>, Vec<String>) {
         drawn_lines.push(line);
         y -= leading;
     }
-    (wrap_pdf(&content), drawn_lines)
+    (content, drawn_lines)
+}
+
+fn build_line_structure_page(lines: &[LineSpec]) -> (Vec<u8>, Vec<String>) {
+    let (content, drawn) = emit_line_structure(lines);
+    (wrap_pdf(&content), drawn)
+}
+
+/// Same page under a CTM rotated by `theta_deg`. A rigid page rotation
+/// changes nothing about the text's logical structure — glyphs that share a
+/// text-space baseline still share it — so the drawn-lines oracle is
+/// unchanged. What rotation DOES change is every post-CTM user-space delta
+/// the flat-path separator heuristics currently measure (issue #443).
+///
+/// The rotation pivots on the content-stream origin, so glyphs may land
+/// outside the MediaBox or at negative coordinates. Harmless by design: the
+/// flat extraction path performs no MediaBox clipping (verified), and the
+/// oracle only cares about line structure, not placement.
+fn build_rotated_line_structure_page(lines: &[LineSpec], theta_deg: f64) -> (Vec<u8>, Vec<String>) {
+    let (inner, drawn) = emit_line_structure(lines);
+    let (s, c) = theta_deg.to_radians().sin_cos();
+    let mut content = Vec::new();
+    write!(content, "q\n{c:.6} {s:.6} {:.6} {c:.6} 0 0 cm\n", -s).unwrap();
+    content.extend_from_slice(&inner);
+    content.extend_from_slice(b"Q\n");
+    (wrap_pdf(&content), drawn)
 }
 
 /// Non-whitespace glyph runs per output line. Empty entries are kept: a
@@ -195,6 +224,24 @@ fn output_line_structure(text: &str) -> Vec<String> {
     text.lines()
         .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
         .collect()
+}
+
+/// Deterministic pin for #443: a single baseline with a same-line backward
+/// correction (the #441 shape), under a 20° page rotation. One line was
+/// drawn, so exactly one line must come out. Today the rotation defeats the
+/// #441 gate (the rotated advance gives every glyph a nonzero user-space Δy)
+/// and the output splits into several lines.
+#[test]
+#[ignore = "issue #443: flat-path separator heuristics measure post-CTM user space; rotated text gains spurious newlines"]
+fn issue_443_rotated_page_keeps_single_line() {
+    let lines = vec![(vec![0, 1], Some((2, 35.0)), 13.0)];
+    let (pdf, drawn) = build_rotated_line_structure_page(&lines, 20.0);
+    let flat = extract(&pdf, false);
+    assert_eq!(
+        output_line_structure(&flat),
+        drawn,
+        "rotated single-baseline page must extract as one line (#443)\n--- flat ---\n{flat}"
+    );
 }
 
 // ---- Drift-chain builder for the #425 token-contiguity property. ----------
@@ -317,6 +364,41 @@ proptest! {
             &got, &drawn,
             "extracted line structure differs from drawn lines\n--- flat ---\n{}",
             flat
+        );
+    }
+
+    /// INV-6 LINE STRUCTURE UNDER ROTATION (#443, pinned): a rigid page
+    /// rotation does not change the text's logical line structure, so the
+    /// drawn-lines oracle of INV-5 must hold under any rotated CTM. Fails
+    /// today: the flat-path separator heuristics measure post-CTM user-space
+    /// deltas, so rotation both defeats the #441 same-baseline gate AND makes
+    /// plain forward advance exceed `newline_threshold` vertically. Becomes a
+    /// permanent guard when #443 is fixed (pen deltas measured in text space).
+    #[test]
+    #[ignore = "issue #443: flat-path separator heuristics measure post-CTM user space; rotated text gains spurious newlines"]
+    fn flat_line_structure_survives_rotation(
+        lines in prop::collection::vec(
+            (
+                prop::collection::vec(0usize..10, 2..5),
+                prop::option::of((0usize..10, 30.0f64..60.0)),
+                prop_oneof![2.0f64..9.5, 12.0f64..30.0],
+            ),
+            3..12,
+        ),
+        theta_deg in prop_oneof![
+            0.5f64..90.0,
+            -90.0f64..-0.5,
+            Just(90.0f64),
+            Just(-90.0f64)
+        ],
+    ) {
+        let (pdf, drawn) = build_rotated_line_structure_page(&lines, theta_deg);
+        let flat = extract(&pdf, false);
+        let got = output_line_structure(&flat);
+        prop_assert_eq!(
+            &got, &drawn,
+            "line structure changed under a {}° page rotation\n--- flat ---\n{}",
+            theta_deg, flat
         );
     }
 
