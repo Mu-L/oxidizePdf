@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
+## [4.2.1] - 2026-07-22
+
+### Fixed
+
+- **Flat-path separator heuristics measured pen movement in post-CTM user
+  space, corrupting line structure under a rotated CTM** (#443).
+  A plain forward advance along a rotated baseline changes the user-space y,
+  which the newline gate misread as a line change (spurious newlines
+  everywhere), and the rotation gave every same-baseline glyph a nonzero Δy,
+  defeating the #441 same-line gate. Pen deltas are now projected onto the
+  current text baseline direction (the image of the text-space x-axis under
+  `Tm × CTM`): Δx along the baseline, Δy perpendicular to it. For
+  axis-aligned content the projection is exactly the previous Δx/Δy — no
+  behavior change — and under rotation it recovers the text's own line
+  geometry, so all the `Tj`/`TJ` separator gates (newline threshold, space
+  threshold, backward-jump wrap) now hold for rotated text. Mirrored
+  (negative-x-scale) baselines now measure Δx along the text's own advance
+  direction, so plain forward advances no longer misfire the backward-jump
+  wrap gate. Axis-aligned shear projects exactly; shear combined with a
+  rotated baseline is approximated. The tracked pen position is the full
+  post-advance point, so rotated baselines advance y as well as x.
+  Degenerate (zero-length or non-finite) baselines fall back to raw
+  user-space deltas. The two line-structure invariants pinned to #443
+  (rotation property + 20° deterministic pin) flip from `#[ignore]` to
+  permanent guards.
+- **A same-line backward X jump was misread as a line wrap** (#441). The
+  flat-path heuristic added for #390 treated any backward pen jump beyond
+  2× `newline_threshold` as a wrap, ignoring Δy — so glyphs repositioned
+  backward on the same baseline (justification, out-of-order emission) gained
+  a spurious newline mid-word. In axis-aligned text a wrap always lands on a
+  different baseline: the heuristic now also requires a nonzero Δy, in both
+  the `Tj` and `TJ` handlers. Tight-leading wraps (small but nonzero Δy, the
+  #390 class) still break. (Rotated/sheared CTMs were initially outside this
+  gate's reach; closed by the #443 fix above in this same release.) A new
+  line-structure property invariant guards both directions —
+  spurious and missing newlines — against generated layouts whose true line
+  structure is known by construction.
+
 ## [4.2.0] - 2026-07-21
 
 ### Fixed
